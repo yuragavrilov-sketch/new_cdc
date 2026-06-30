@@ -44,13 +44,21 @@ TICK_INTERVAL = 5  # seconds
 # Phases that occupy a data-load slot. Bulk and CDC have independent slots, so
 # a CDC table and a historical table can move in parallel. Post-load index
 # rebuilds are worker jobs and do not keep the load slot busy.
+#
+# The slot covers only the phases that READ FROM SOURCE and therefore contend
+# on the source Oracle: chunking (DBMS_PARALLEL_EXECUTE on source), bulk load
+# (SELECT ... AS OF SCN), and stage validation (COUNT source AS OF SCN).
+#
+# Baseline (stage -> target) and stage-drop touch only the TARGET Oracle, so
+# they are intentionally NOT in the slot: as soon as a migration reaches
+# BASELINE_PUBLISHING the slot frees and the NEXT migration starts its bulk load
+# from source. Source-read (next table) and target-write (current baseline) then
+# overlap, since they hit different databases.
 _HEAVY_PHASES = frozenset({
     "TOPIC_CREATING",
     "CHUNKING",
     "BULK_LOADING", "BULK_LOADED",
     "STAGE_VALIDATING", "STAGE_VALIDATED",
-    "BASELINE_PUBLISHING", "BASELINE_LOADING", "BASELINE_PUBLISHED",
-    "STAGE_DROPPING",
 })
 
 # Track migrations running in a dedicated thread (long-running phases)

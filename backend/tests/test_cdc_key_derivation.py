@@ -1903,6 +1903,21 @@ def test_orchestrator_index_enable_phase_releases_load_slot():
     assert orchestrator._plan_item_status_for_phase("INDEXES_ENABLING") == "DONE"
 
 
+def test_orchestrator_baseline_phases_release_load_slot():
+    # Baseline writes only to the target Oracle, so it must NOT hold the load
+    # slot — the next migration's bulk load (source read) should start as soon as
+    # the current migration reaches baseline. Source-read phases keep the slot.
+    for phase in (
+        "BASELINE_PUBLISHING",
+        "BASELINE_LOADING",
+        "BASELINE_PUBLISHED",
+        "STAGE_DROPPING",
+    ):
+        assert phase not in orchestrator._HEAVY_PHASES
+    for phase in ("CHUNKING", "BULK_LOADING", "STAGE_VALIDATING"):
+        assert phase in orchestrator._HEAVY_PHASES
+
+
 def test_orchestrator_keeps_plan_running_when_no_pending_but_active_items():
     assert orchestrator._plan_status_without_pending(
         active_count=1,
