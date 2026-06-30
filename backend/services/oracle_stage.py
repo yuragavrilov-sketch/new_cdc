@@ -185,6 +185,14 @@ def create_stage_table(
                         print(f"[oracle_stage] {tgt_full} already exists")
                     cur.execute(f"TRUNCATE TABLE {tgt_full}")
                     dst_conn.commit()
+                    # Ensure NOLOGGING so the bulk APPEND_VALUES direct-path load
+                    # skips redo (stage is throwaway — re-truncated/re-chunked on
+                    # restart, and stage validation catches any lost blocks).
+                    try:
+                        cur.execute(f'ALTER TABLE {tgt_full} NOLOGGING')
+                        dst_conn.commit()
+                    except Exception as nolog_exc:
+                        print(f"[oracle_stage] {tgt_full} NOLOGGING failed: {nolog_exc}")
                     print(f"[oracle_stage] truncated existing stage table {tgt_full}")
                     return
                 raise

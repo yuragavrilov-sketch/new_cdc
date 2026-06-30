@@ -157,6 +157,30 @@ def test_enable_target_indexes_defers_failed_referencing_fk():
     assert result["errors"] == {"indexes": [], "constraints": []}
 
 
+def test_enable_target_indexes_rebuilds_indexes_parallel(monkeypatch):
+    monkeypatch.setattr(worker, "INDEX_REBUILD_PARALLEL", True)
+    conn = _FlexConn(unusable_indexes=[("IDX1",)])
+
+    result = worker._enable_target_indexes(conn, "TGT", "T")
+
+    sqls = [sql for sql, _params in conn.executed]
+    assert 'ALTER INDEX "TGT"."IDX1" REBUILD NOLOGGING PARALLEL' in sqls
+    # Degree reset afterwards so future DML doesn't go parallel.
+    assert 'ALTER INDEX "TGT"."IDX1" NOPARALLEL' in sqls
+    assert result["enabled"]["indexes"] == ["IDX1"]
+
+
+def test_enable_target_indexes_serial_rebuild_when_disabled(monkeypatch):
+    monkeypatch.setattr(worker, "INDEX_REBUILD_PARALLEL", False)
+    conn = _FlexConn(unusable_indexes=[("IDX1",)])
+
+    worker._enable_target_indexes(conn, "TGT", "T")
+
+    sqls = [sql for sql, _params in conn.executed]
+    assert 'ALTER INDEX "TGT"."IDX1" REBUILD NOLOGGING' in sqls
+    assert not any("NOPARALLEL" in s for s in sqls)
+
+
 def test_enable_target_indexes_pk_failure_is_fatal():
     conn = _FlexConn(
         own_constraints=[("PK_SELF", "P")],

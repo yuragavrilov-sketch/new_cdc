@@ -69,7 +69,7 @@ try:
 except ImportError:
     pass
 
-BULK_BATCH_SIZE    = int(os.environ.get("BULK_BATCH_SIZE",    5_000))
+BULK_BATCH_SIZE    = int(os.environ.get("BULK_BATCH_SIZE",    20_000))
 BULK_POLL_INTERVAL = int(os.environ.get("BULK_POLL_INTERVAL", 5))
 CDC_BATCH_SIZE     = int(os.environ.get("CDC_BATCH_SIZE",     500))
 CDC_CHECKIN_SEC    = int(os.environ.get("CDC_CHECKIN_SEC",    30))
@@ -78,6 +78,9 @@ CDC_POLL_ERROR_THRESHOLD = max(1, int(os.environ.get("CDC_POLL_ERROR_THRESHOLD",
 CDC_SCAN_INTERVAL  = int(os.environ.get("CDC_SCAN_INTERVAL",  3))
 CMP_POLL_INTERVAL  = int(os.environ.get("CMP_POLL_INTERVAL",  5))
 WORKER_HEARTBEAT_SEC = int(os.environ.get("WORKER_HEARTBEAT_SEC", 10))
+# Rebuild post-load indexes with PARALLEL (degree reset to NOPARALLEL after) —
+# large index rebuilds are much faster in parallel. Disable for tiny tables.
+INDEX_REBUILD_PARALLEL = os.environ.get("INDEX_REBUILD_PARALLEL", "true").lower() == "true"
 
 # Sentinel Debezium emits for a LOB column that was NOT changed by an UPDATE
 # (only changed columns are mined for LOBs). Must match the connector's
@@ -1161,7 +1164,14 @@ def _enable_target_indexes(conn, schema: str, table: str) -> dict:
     s = schema.upper()
     t = table.upper()
     is_temp = _is_temporary_table(conn, s, t)
-    rebuild_clause = "REBUILD" if is_temp else "REBUILD NOLOGGING"
+    # PARALLEL only for real tables (GTT indexes can't be NOLOGGING/parallel here).
+    parallel_rebuild = INDEX_REBUILD_PARALLEL and not is_temp
+    if is_temp:
+        rebuild_clause = "REBUILD"
+    elif parallel_rebuild:
+        rebuild_clause = "REBUILD NOLOGGING PARALLEL"
+    else:
+        rebuild_clause = "REBUILD NOLOGGING"
     enabled = {"indexes": [], "constraints": [], "fk_novalidate": [], "referencing_fk_novalidate": []}
     errors = {"indexes": [], "constraints": []}
     # FK enable failures are NOT fatal: enabling an FK (even NOVALIDATE) requires
@@ -1187,6 +1197,13 @@ def _enable_target_indexes(conn, schema: str, table: str) -> dict:
         for index_name in indexes:
             try:
                 cur.execute(f'ALTER INDEX "{s}"."{index_name}" {rebuild_clause}')
+                if parallel_rebuild:
+                    # Reset the degree so later DML/queries don't silently go
+                    # parallel just because we rebuilt with PARALLEL.
+                    try:
+                        cur.execute(f'ALTER INDEX "{s}"."{index_name}" NOPARALLEL')
+                    except Exception as np_exc:
+                        print(f"[target_index] {s}.{index_name} NOPARALLEL reset failed: {np_exc}")
                 enabled["indexes"].append(index_name)
             except Exception as exc:
                 errors["indexes"].append({"name": index_name, "error": str(exc)})
