@@ -198,3 +198,66 @@ def test_truncate_table_for_load_disables_child_fk_and_parent_key_cascade():
         "key_constraints": ["P:PARENT_PK"],
     }
     assert conn.commits >= 3
+
+
+class ReconcileCursorStub:
+    def __init__(self, conn):
+        self.conn = conn
+        self.sql = ""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, sql: str, params=None, **_kwargs):
+        self.sql = sql
+        self.conn.executed.append((sql, params))
+        if "ENABLE NOVALIDATE CONSTRAINT" in sql:
+            for frag in self.conn.fail_on:
+                if frag in sql:
+                    raise Exception("ORA-02298: parent keys not found")
+
+    def fetchall(self):
+        # Own disabled outbound FKs of CHILD.
+        if "constraint_type = 'R'" in self.sql and "status = 'DISABLED'" in self.sql:
+            return [("FK_SELF_PARENT",)]
+        # Child FKs referencing CHILD (none here).
+        if "FROM   all_constraints fk" in self.sql:
+            return []
+        return []
+
+
+class ReconcileConnStub:
+    def __init__(self, fail_on=()):
+        self.executed = []
+        self.committed = False
+        self.fail_on = fail_on
+
+    def cursor(self):
+        return ReconcileCursorStub(self)
+
+    def commit(self):
+        self.committed = True
+
+
+def test_enable_disabled_foreign_keys_enables_own_fk():
+    conn = ReconcileConnStub()
+
+    result = oracle_browser.enable_disabled_foreign_keys(conn, "TGT", "CHILD")
+
+    assert 'ALTER TABLE "TGT"."CHILD" ENABLE NOVALIDATE CONSTRAINT "FK_SELF_PARENT"' in [
+        sql for sql, _params in conn.executed
+    ]
+    assert result["enabled"] == ["TGT.CHILD.FK_SELF_PARENT"]
+    assert result["still_disabled"] == []
+
+
+def test_enable_disabled_foreign_keys_reports_still_disabled():
+    conn = ReconcileConnStub(fail_on=['CONSTRAINT "FK_SELF_PARENT"'])
+
+    result = oracle_browser.enable_disabled_foreign_keys(conn, "TGT", "CHILD")
+
+    assert result["enabled"] == []
+    assert [d["name"] for d in result["still_disabled"]] == ["TGT.CHILD.FK_SELF_PARENT"]

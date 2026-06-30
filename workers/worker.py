@@ -1082,6 +1082,13 @@ def _enable_target_indexes(conn, schema: str, table: str) -> dict:
     rebuild_clause = "REBUILD" if is_temp else "REBUILD NOLOGGING"
     enabled = {"indexes": [], "constraints": [], "fk_novalidate": [], "referencing_fk_novalidate": []}
     errors = {"indexes": [], "constraints": []}
+    # FK enable failures are NOT fatal: enabling an FK (even NOVALIDATE) requires
+    # the referenced parent's PK/UK to be ENABLED. When the parent table is still
+    # mid-migration (its PK temporarily disabled by baseline), the FK can't enable
+    # yet. We collect those here and let the parent's own INDEXES_ENABLING pass (or
+    # the orchestrator FK-reconcile) enable them once the parent is ready, instead
+    # of failing the whole migration.
+    deferred_fk: list[dict] = []
 
     with conn.cursor() as cur:
         cur.execute(f'ALTER TABLE "{s}"."{t}" LOGGING')
@@ -1125,7 +1132,12 @@ def _enable_target_indexes(conn, schema: str, table: str) -> dict:
                     )
                     enabled["constraints"].append(constraint_name)
             except Exception as exc:
-                errors["constraints"].append({"name": constraint_name, "error": str(exc)})
+                if constraint_type == "R":
+                    # FK failure → defer (parent PK may not be enabled yet).
+                    deferred_fk.append({"name": constraint_name, "error": str(exc)})
+                else:
+                    # PK/UK/CHECK failure → fatal.
+                    errors["constraints"].append({"name": constraint_name, "error": str(exc)})
 
         for owner, child_table, constraint_name in _referencing_foreign_keys(conn, s, t, "DISABLED"):
             display_name = f"{owner}.{child_table}.{constraint_name}"
@@ -1135,10 +1147,11 @@ def _enable_target_indexes(conn, schema: str, table: str) -> dict:
                 )
                 enabled["referencing_fk_novalidate"].append(display_name)
             except Exception as exc:
-                errors["constraints"].append({"name": display_name, "error": str(exc)})
+                # Referencing FK failure → defer, never fatal.
+                deferred_fk.append({"name": display_name, "error": str(exc)})
 
     conn.commit()
-    return {"enabled": enabled, "errors": errors}
+    return {"enabled": enabled, "deferred_fk": deferred_fk, "errors": errors}
 
 
 def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
@@ -1160,6 +1173,14 @@ def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
             raise RuntimeError(
                 f"Could not enable target indexes/constraints: {', '.join(names)}. {result['errors']}"
             )
+        deferred = result.get("deferred_fk") or []
+        if deferred:
+            # Non-fatal: FKs whose parent key isn't enabled yet. The orchestrator
+            # FK-reconcile (and the parent's own INDEXES_ENABLING) will enable them
+            # once the parent is ready.
+            print(f"[target_index] {tag} DONE with {len(deferred)} deferred FK(s) "
+                  f"(parent key not enabled yet): "
+                  f"{', '.join(d['name'] for d in deferred)}")
         db.complete_target_index_job(pg_conn, job_id, result)
         print(f"[target_index] {tag} DONE")
     except Exception as exc:

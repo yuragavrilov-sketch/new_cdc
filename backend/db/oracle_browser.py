@@ -1161,3 +1161,52 @@ def enable_triggers(conn, schema: str, table: str) -> dict:
 
     conn.commit()
     return {"enabled": enabled, "errors": errors}
+
+
+def enable_disabled_foreign_keys(conn, schema: str, table: str) -> dict:
+    """Best-effort ENABLE NOVALIDATE of every currently-DISABLED foreign key that
+    touches *schema.table* — the table's own outbound FKs and the child FKs that
+    reference it.
+
+    Used by the orchestrator to reconcile FKs that INDEXES_ENABLING left disabled
+    because a referenced parent's PK was not yet enabled. Idempotent and never
+    raises per FK; an FK that still can't enable (parent PK still down) is reported
+    in ``still_disabled`` for the next pass.
+
+    Returns {"enabled": [display...], "still_disabled": [{"name","error"}...]}.
+    """
+    s = schema.upper()
+    t = table.upper()
+    enabled: list[str] = []
+    still: list[dict] = []
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT constraint_name
+            FROM   all_constraints
+            WHERE  owner = :s
+              AND  table_name = :t
+              AND  constraint_type = 'R'
+              AND  status = 'DISABLED'
+            ORDER BY constraint_name
+        """, {"s": s, "t": t})
+        targets = [(s, t, row[0]) for row in cur.fetchall()]
+
+    targets += [
+        (fk["owner"], fk["table_name"], fk["constraint_name"])
+        for fk in get_referencing_foreign_keys(conn, s, t, status="DISABLED")
+    ]
+
+    with conn.cursor() as cur:
+        for owner, tbl, cname in targets:
+            display = f"{owner}.{tbl}.{cname}"
+            try:
+                cur.execute(
+                    f'ALTER TABLE "{owner}"."{tbl}" ENABLE NOVALIDATE CONSTRAINT "{cname}"'
+                )
+                enabled.append(display)
+            except Exception as exc:
+                still.append({"name": display, "error": str(exc)})
+
+    conn.commit()
+    return {"enabled": enabled, "still_disabled": still}

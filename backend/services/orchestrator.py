@@ -134,6 +134,9 @@ def _tick() -> None:
     # Check connector group health
     _check_group_connectors()
 
+    # Re-attempt FKs that INDEXES_ENABLING left disabled (parent not ready then)
+    _maybe_reconcile_deferred_fks()
+
 
 def _dispatch(migration_id: str, phase: str, m: dict) -> None:
     handler = _PHASE_HANDLERS.get(phase)
@@ -656,6 +659,102 @@ def _update_queue_positions() -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+# FK reconcile is best-effort; guard against overlapping runs across ticks.
+_fk_reconcile_state = {"running": False}
+
+# Phases where the migration is past INDEXES_ENABLING and its FKs should be on.
+_FK_RECONCILE_PHASES = (
+    "CDC_APPLYING", "CDC_CATCHING_UP", "CDC_CAUGHT_UP", "STEADY_STATE",
+    "DATA_VERIFYING", "COMPLETED",
+)
+
+
+def _maybe_reconcile_deferred_fks() -> None:
+    """Enable FKs that a prior INDEXES_ENABLING left disabled because the
+    referenced parent's PK was not enabled yet.
+
+    Cheap when there is nothing to do: a single indexed PG query. Real work
+    (opening the target Oracle) happens in a background thread only when some
+    DONE index job still carries a non-empty ``deferred_fk`` list and its
+    migration is already past INDEXES_ENABLING.
+    """
+    if _fk_reconcile_state["running"]:
+        return
+
+    placeholders = ",".join(["%s"] * len(_FK_RECONCILE_PHASES))
+    conn = _state["get_conn"]()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT j.job_id, j.migration_id, j.result_json,
+                       m.target_connection_id, m.target_schema, m.target_table
+                FROM   target_index_jobs j
+                JOIN   migrations m ON m.migration_id = j.migration_id
+                WHERE  j.state = 'DONE'
+                  AND  jsonb_array_length(
+                           COALESCE(j.result_json -> 'deferred_fk', '[]'::jsonb)
+                       ) > 0
+                  AND  m.phase IN ({placeholders})
+                LIMIT 50
+            """, _FK_RECONCILE_PHASES)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return
+
+    _fk_reconcile_state["running"] = True
+
+    def _run():
+        try:
+            for job_id, mid, result_json, tgt_conn_id, tgt_schema, tgt_table in rows:
+                try:
+                    if isinstance(result_json, str):
+                        try:
+                            result = json.loads(result_json)
+                        except Exception:
+                            result = {}
+                    elif isinstance(result_json, dict):
+                        result = result_json
+                    else:
+                        result = {}
+
+                    dst_cfg = _oracle_cfg(tgt_conn_id)
+                    ora = oracle_scn.open_oracle_conn(dst_cfg)
+                    try:
+                        outcome = oracle_browser.enable_disabled_foreign_keys(
+                            ora, tgt_schema, tgt_table,
+                        )
+                    finally:
+                        ora.close()
+
+                    still = outcome.get("still_disabled") or []
+                    result["deferred_fk"] = still
+
+                    pg = _state["get_conn"]()
+                    try:
+                        with pg.cursor() as cur:
+                            cur.execute(
+                                "UPDATE target_index_jobs SET result_json = %s::jsonb "
+                                "WHERE job_id = %s",
+                                (json.dumps(result), job_id),
+                            )
+                        pg.commit()
+                    finally:
+                        pg.close()
+
+                    if outcome.get("enabled"):
+                        print(f"[fk-reconcile] {tgt_schema}.{tgt_table}: enabled "
+                              f"{outcome['enabled']}; still_disabled={len(still)}")
+                except Exception as exc:
+                    print(f"[fk-reconcile] {mid} error: {exc}")
+        finally:
+            _fk_reconcile_state["running"] = False
+
+    threading.Thread(target=_run, daemon=True, name="fk-reconcile").start()
 
 
 def _kick_new_migrations_for_group(group_id: str) -> None:

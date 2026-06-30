@@ -64,4 +64,155 @@ def test_enable_target_indexes_enables_referencing_fk_novalidate():
     ]
     assert result["enabled"]["referencing_fk_novalidate"] == ["TGT.CHILD.FK_CHILD_PARENT"]
     assert result["errors"] == {"indexes": [], "constraints": []}
+    assert result["deferred_fk"] == []
     assert conn.committed
+
+
+# ---------------------------------------------------------------------------
+# Deferred-FK behaviour: FK enable failures must NOT fail the migration; index
+# and PK/UK/CHECK failures must stay fatal.
+# ---------------------------------------------------------------------------
+
+class _FlexCursor:
+    """Cursor stub driven by table attributes on its connection."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.sql = ""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.sql = sql
+        self.conn.executed.append((sql, params))
+        if "ENABLE" in sql and sql.strip().startswith("ALTER TABLE"):
+            for frag in self.conn.fail_on:
+                if frag in sql:
+                    raise Exception("ORA-02298: cannot validate - parent keys not found")
+
+    def fetchone(self):
+        if "FROM   all_tables" in self.sql:
+            return ("N",)
+        return None
+
+    def fetchall(self):
+        if "FROM   all_indexes" in self.sql:
+            return list(self.conn.unusable_indexes)
+        if "constraint_type IN ('P','U','R','C')" in self.sql:
+            return list(self.conn.own_constraints)
+        if "FROM   all_constraints fk" in self.sql:
+            return list(self.conn.referencing)
+        return []
+
+
+class _FlexConn:
+    def __init__(self, *, own_constraints=(), referencing=(),
+                 unusable_indexes=(), fail_on=()):
+        self.own_constraints = own_constraints
+        self.referencing = referencing
+        self.unusable_indexes = unusable_indexes
+        self.fail_on = fail_on
+        self.executed = []
+        self.committed = False
+
+    def cursor(self):
+        return _FlexCursor(self)
+
+    def commit(self):
+        self.committed = True
+
+    def close(self):
+        pass
+
+
+def test_enable_target_indexes_defers_failed_own_fk():
+    # Own outbound FK can't enable because the parent PK isn't enabled yet.
+    conn = _FlexConn(
+        own_constraints=[("FK_SELF_PARENT", "R"), ("PK_SELF", "P")],
+        fail_on=['CONSTRAINT "FK_SELF_PARENT"'],
+    )
+
+    result = worker._enable_target_indexes(conn, "TGT", "CHILD")
+
+    # FK failure is deferred, not fatal.
+    assert [d["name"] for d in result["deferred_fk"]] == ["FK_SELF_PARENT"]
+    assert result["errors"] == {"indexes": [], "constraints": []}
+    # The PK still enabled successfully.
+    assert "PK_SELF" in result["enabled"]["constraints"]
+
+
+def test_enable_target_indexes_defers_failed_referencing_fk():
+    conn = _FlexConn(
+        referencing=[("TGT", "CHILD", "FK_CHILD_PARENT")],
+        fail_on=['CONSTRAINT "FK_CHILD_PARENT"'],
+    )
+
+    result = worker._enable_target_indexes(conn, "TGT", "PARENT")
+
+    assert [d["name"] for d in result["deferred_fk"]] == ["TGT.CHILD.FK_CHILD_PARENT"]
+    assert result["errors"] == {"indexes": [], "constraints": []}
+
+
+def test_enable_target_indexes_pk_failure_is_fatal():
+    conn = _FlexConn(
+        own_constraints=[("PK_SELF", "P")],
+        fail_on=['CONSTRAINT "PK_SELF"'],
+    )
+
+    result = worker._enable_target_indexes(conn, "TGT", "CHILD")
+
+    assert [e["name"] for e in result["errors"]["constraints"]] == ["PK_SELF"]
+    assert result["deferred_fk"] == []
+
+
+def test_process_target_index_job_completes_when_only_fk_deferred(monkeypatch):
+    conn = _FlexConn(
+        own_constraints=[("FK_SELF_PARENT", "R")],
+        fail_on=['CONSTRAINT "FK_SELF_PARENT"'],
+    )
+    completed, failed = [], []
+    monkeypatch.setattr(worker.db, "open_oracle", lambda *_a: conn)
+    monkeypatch.setattr(worker.db, "complete_target_index_job",
+                        lambda _pg, job_id, result: completed.append((job_id, result)))
+    monkeypatch.setattr(worker.db, "fail_target_index_job",
+                        lambda _pg, job_id, err: failed.append((job_id, err)))
+
+    job = {
+        "job_id": "job-1",
+        "target_connection_id": "oracle_target",
+        "target_schema": "TGT",
+        "target_table": "CHILD",
+    }
+    worker.process_target_index_job(job, object(), {})
+
+    assert failed == []
+    assert len(completed) == 1
+    assert [d["name"] for d in completed[0][1]["deferred_fk"]] == ["FK_SELF_PARENT"]
+
+
+def test_process_target_index_job_fails_on_pk_error(monkeypatch):
+    conn = _FlexConn(
+        own_constraints=[("PK_SELF", "P")],
+        fail_on=['CONSTRAINT "PK_SELF"'],
+    )
+    completed, failed = [], []
+    monkeypatch.setattr(worker.db, "open_oracle", lambda *_a: conn)
+    monkeypatch.setattr(worker.db, "complete_target_index_job",
+                        lambda _pg, job_id, result: completed.append((job_id, result)))
+    monkeypatch.setattr(worker.db, "fail_target_index_job",
+                        lambda _pg, job_id, err: failed.append((job_id, err)))
+
+    job = {
+        "job_id": "job-2",
+        "target_connection_id": "oracle_target",
+        "target_schema": "TGT",
+        "target_table": "CHILD",
+    }
+    worker.process_target_index_job(job, object(), {})
+
+    assert completed == []
+    assert len(failed) == 1
