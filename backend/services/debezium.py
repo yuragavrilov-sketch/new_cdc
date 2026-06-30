@@ -176,6 +176,13 @@ def create_group_connector(
         "lob.enabled":           "true" if lob_enabled else "false",
         "lob.fetch.size":        os.getenv("DEBEZIUM_LOB_FETCH_SIZE", "0"),
         "lob.fetch.buffer.size": os.getenv("DEBEZIUM_LOB_FETCH_BUFFER_SIZE", "0"),
+        # Sentinel emitted for a LOB column an UPDATE did not change. The CDC
+        # apply worker drops columns equal to it so the existing LOB is kept
+        # instead of being overwritten (must match CDC_UNAVAILABLE_PLACEHOLDER).
+        "unavailable.value.placeholder": os.getenv(
+            "DEBEZIUM_UNAVAILABLE_PLACEHOLDER", "__debezium_unavailable_value"),
+        # Encode binary (BLOB/RAW) as base64; the worker decodes it back to bytes.
+        "binary.handling.mode": os.getenv("DEBEZIUM_BINARY_HANDLING_MODE", "base64"),
 
         # Schema history
         "schema.history.internal.kafka.bootstrap.servers": bootstrap,

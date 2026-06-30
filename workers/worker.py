@@ -19,6 +19,7 @@ Environment variables (see .env.example):
     WORKER_HEARTBEAT_SEC Seconds between worker liveness writes (default: 10)
 """
 
+import base64
 import json
 import os
 import sys
@@ -57,9 +58,14 @@ from common import WORKER_ID
 # Fetch LOBs (CLOB/BLOB/NCLOB) as Python str/bytes directly — LOB locators
 # from AS OF SCN flashback cursors are invalid outside the fetching cursor,
 # which causes ORA-64219.  Setting this globally is safe for bulk copy.
+_LOB_DBTYPES: tuple = ()
 try:
     import oracledb
     oracledb.defaults.fetch_lobs = False
+    # LOB column DB types — used to bind bulk inserts as LOBs (streamed) instead
+    # of letting oracledb preallocate a full per-batch char/byte buffer, which
+    # would OOM on multi-MB LOBs at BULK_BATCH_SIZE rows.
+    _LOB_DBTYPES = (oracledb.DB_TYPE_CLOB, oracledb.DB_TYPE_NCLOB, oracledb.DB_TYPE_BLOB)
 except ImportError:
     pass
 
@@ -72,6 +78,19 @@ CDC_POLL_ERROR_THRESHOLD = max(1, int(os.environ.get("CDC_POLL_ERROR_THRESHOLD",
 CDC_SCAN_INTERVAL  = int(os.environ.get("CDC_SCAN_INTERVAL",  3))
 CMP_POLL_INTERVAL  = int(os.environ.get("CMP_POLL_INTERVAL",  5))
 WORKER_HEARTBEAT_SEC = int(os.environ.get("WORKER_HEARTBEAT_SEC", 10))
+
+# Sentinel Debezium emits for a LOB column that was NOT changed by an UPDATE
+# (only changed columns are mined for LOBs). Must match the connector's
+# unavailable.value.placeholder (see services/debezium.py). The CDC apply path
+# DROPS columns equal to this sentinel so an unchanged LOB is not overwritten.
+CDC_UNAVAILABLE_PLACEHOLDER = os.environ.get(
+    "CDC_UNAVAILABLE_PLACEHOLDER", "__debezium_unavailable_value"
+)
+# Same sentinel as it appears for a binary (BLOB/RAW) column under
+# binary.handling.mode=base64 — the bytes of the placeholder, base64-encoded.
+_CDC_UNAVAILABLE_PLACEHOLDER_B64 = base64.b64encode(
+    CDC_UNAVAILABLE_PLACEHOLDER.encode("utf-8")
+).decode("ascii")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -96,12 +115,22 @@ def _build_insert(cursor_description, target_schema: str,
         f'"{target_schema.upper()}"."{stage_table.upper()}" '
         f'({cols}) VALUES ({params})'
     )
-    return sql, bind_names
+    # Bind LOB columns explicitly as LOBs so oracledb streams them instead of
+    # sizing a full per-batch buffer from the data (OOM risk on large LOBs).
+    lob_inputsizes = {
+        bind_names[i]: d[1]
+        for i, d in enumerate(cursor_description)
+        if _LOB_DBTYPES and d[1] in _LOB_DBTYPES
+    }
+    return sql, bind_names, lob_inputsizes
 
 
-def _flush_batch(dst_conn, insert_sql: str, batch: list) -> None:
+def _flush_batch(dst_conn, insert_sql: str, batch: list,
+                 lob_inputsizes: dict | None = None) -> None:
     """Execute one batch insert and commit."""
     with dst_conn.cursor() as ic:
+        if lob_inputsizes:
+            ic.setinputsizes(**lob_inputsizes)
         ic.executemany(insert_sql, batch)
     dst_conn.commit()
 
@@ -146,13 +175,14 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
                     f'WHERE ROWID BETWEEN CHARTOROWID(:p_start) AND CHARTOROWID(:p_end)',
                     {"p_start": rowid_start, "p_end": rowid_end},
                 )
-            insert_sql, bind_names = _build_insert(cur.description, tgt_schema, dest_table)
+            insert_sql, bind_names, lob_inputsizes = _build_insert(
+                cur.description, tgt_schema, dest_table)
             while True:
                 rows = cur.fetchmany(BULK_BATCH_SIZE)
                 if not rows:
                     break
                 batch = [dict(zip(bind_names, row)) for row in rows]
-                _flush_batch(dst_conn, insert_sql, batch)
+                _flush_batch(dst_conn, insert_sql, batch, lob_inputsizes)
                 rows_loaded += len(batch)
                 db.update_chunk_progress(pg_conn, chunk_id, rows_loaded)
                 print(f"  → {rows_loaded} rows")
@@ -549,6 +579,49 @@ def _parse_debezium(msg_value: bytes) -> Optional[dict]:
     return None
 
 
+# Oracle binary column types. Under binary.handling.mode=base64 their values
+# arrive as base64 strings and must be decoded back to bytes before binding.
+_BINARY_COL_TYPES = frozenset({"BLOB", "RAW", "LONG RAW"})
+
+
+def _binary_columns(conn, schema: str, table: str) -> set:
+    """Names of binary (BLOB/RAW) columns on the target table."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name, data_type
+            FROM   all_tab_columns
+            WHERE  owner = :s AND table_name = :t
+        """, {"s": schema.upper(), "t": table.upper()})
+        return {r[0] for r in cur.fetchall() if r[1] in _BINARY_COL_TYPES}
+
+
+def _sanitize_lob_values(row: dict, binary_cols: set) -> dict:
+    """Prepare a Debezium row for binding into Oracle.
+
+    1. DROP columns equal to the unavailable-value placeholder: an UPDATE that
+       did not touch a LOB column carries this sentinel, not the value. Dropping
+       the column omits it from the MERGE so the existing LOB is preserved
+       instead of being overwritten with the sentinel string.
+    2. base64-decode binary (BLOB/RAW) columns back to bytes.
+    """
+    if not row:
+        return row
+    out: dict = {}
+    for col, val in row.items():
+        if isinstance(val, str) and val in (
+            CDC_UNAVAILABLE_PLACEHOLDER, _CDC_UNAVAILABLE_PLACEHOLDER_B64,
+        ):
+            continue  # unchanged LOB — leave target value untouched
+        if col in binary_cols and isinstance(val, str):
+            try:
+                out[col] = base64.b64decode(val)
+            except Exception:
+                out[col] = val
+            continue
+        out[col] = val
+    return out
+
+
 def cdc_thread(migration: dict, stop_event: threading.Event) -> None:
     """Long-running thread: apply Debezium events for one migration."""
     migration_id = migration["migration_id"]
@@ -603,6 +676,7 @@ def cdc_thread(migration: dict, stop_event: threading.Event) -> None:
             max_poll_records=CDC_BATCH_SIZE,
         )
         oracle_conn     = db.open_oracle(migration["target_connection_id"], configs)
+        binary_cols     = _binary_columns(oracle_conn, target_schema, target_table)
         last_checkin_ts = time.time()
         rows_applied    = 0
     except Exception as exc:
@@ -662,6 +736,8 @@ def cdc_thread(migration: dict, stop_event: threading.Event) -> None:
                     event = _parse_debezium(msg.value)
                     if event is None:
                         continue
+                    if event.get("after"):
+                        event["after"] = _sanitize_lob_values(event["after"], binary_cols)
                     try:
                         _apply_event(oracle_conn, event,
                                      target_schema, target_table, key_cols)
@@ -843,13 +919,19 @@ def cdc_manager(stop_event: threading.Event) -> None:
 
 # Column types to skip in hash computation (must match routes/data_compare.py)
 _CMP_SKIP_TYPES = frozenset({
-    "BLOB", "CLOB", "NCLOB", "BFILE", "LONG", "LONG RAW",
+    "BFILE", "LONG", "LONG RAW",
     "XMLTYPE", "SDO_GEOMETRY", "ANYDATA", "URITYPE",
 })
+
+# LOBs ARE compared, by length — catches placeholder corruption / base64 bloat /
+# truncation without DBMS_CRYPTO. Must match routes/data_compare.py (_LOB_TYPES).
+_CMP_LOB_TYPES = frozenset({"BLOB", "CLOB", "NCLOB"})
 
 
 def _cmp_col_expr(col_name: str, col_type: str) -> str:
     q = f'"{col_name}"'
+    if col_type in _CMP_LOB_TYPES:
+        return f"NVL(TO_CHAR(DBMS_LOB.GETLENGTH({q})), CHR(0))"
     if col_type == "DATE":
         return f"NVL(TO_CHAR({q}, 'YYYY-MM-DD HH24:MI:SS'), CHR(0))"
     if col_type.startswith("TIMESTAMP"):

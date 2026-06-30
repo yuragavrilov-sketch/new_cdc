@@ -18,11 +18,17 @@ bp = Blueprint("data_compare", __name__)
 
 _state: dict = {}
 
-# Column types to skip when computing row hashes (LOBs, spatial, etc.)
+# Column types to skip when computing row hashes (spatial, legacy LONG, etc.)
+# NOTE: keep in sync with workers/worker.py (_CMP_SKIP_TYPES / _CMP_LOB_TYPES).
 _SKIP_TYPES = frozenset({
-    "BLOB", "CLOB", "NCLOB", "BFILE", "LONG", "LONG RAW",
+    "BFILE", "LONG", "LONG RAW",
     "XMLTYPE", "SDO_GEOMETRY", "ANYDATA", "URITYPE",
 })
+
+# LOBs that ARE compared — by length (see col_expr). A full-content hash needs
+# DBMS_CRYPTO privileges and is expensive; length already catches the realistic
+# corruption modes: unavailable-value placeholder, base64 bloat, truncation.
+_LOB_TYPES = frozenset({"BLOB", "CLOB", "NCLOB"})
 
 
 def init(get_conn_fn, load_configs_fn, broadcast_fn):
@@ -38,6 +44,9 @@ def init(get_conn_fn, load_configs_fn, broadcast_fn):
 def col_expr(col_name: str, col_type: str) -> str:
     """Build NVL(TO_CHAR(...), CHR(0)) expression for a single column."""
     q = f'"{col_name}"'
+    if col_type in _LOB_TYPES:
+        # LOBs can't be TO_CHAR'd / compared directly — hash their length.
+        return f"NVL(TO_CHAR(DBMS_LOB.GETLENGTH({q})), CHR(0))"
     if col_type == "DATE":
         return f"NVL(TO_CHAR({q}, 'YYYY-MM-DD HH24:MI:SS'), CHR(0))"
     if col_type.startswith("TIMESTAMP"):

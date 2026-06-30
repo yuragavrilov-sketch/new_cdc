@@ -280,6 +280,9 @@ def test_cdc_thread_uses_heartbeat_only_until_lag_partitions_exist(monkeypatch):
     monkeypatch.setattr(worker.db, "get_pg_conn", lambda: PgConn())
     monkeypatch.setattr(worker.db, "load_configs", lambda _pg: {"kafka": {"bootstrap_servers": "broker:9092"}})
     monkeypatch.setattr(worker.db, "open_oracle", lambda *_args: OracleConn())
+    # Binary-column detection is covered by test_worker_lob; these tests use a
+    # minimal OracleConn stub and only exercise the apply loop.
+    monkeypatch.setattr(worker, "_binary_columns", lambda *_a: set())
     monkeypatch.setattr(worker, "_calc_lag", lambda *_args: (0, {}))
     monkeypatch.setattr(worker.db, "cdc_checkin", lambda *_args, **_kwargs: calls.append(("checkin",)))
     monkeypatch.setattr(worker.db, "cdc_heartbeat", lambda _pg, mid: calls.append(("heartbeat", mid)))
@@ -330,6 +333,9 @@ def test_cdc_thread_triggers_caught_up_when_measured_lag_is_zero(monkeypatch):
     monkeypatch.setattr(worker.db, "get_pg_conn", lambda: PgConn())
     monkeypatch.setattr(worker.db, "load_configs", lambda _pg: {"kafka": {"bootstrap_servers": "broker:9092"}})
     monkeypatch.setattr(worker.db, "open_oracle", lambda *_args: OracleConn())
+    # Binary-column detection is covered by test_worker_lob; these tests use a
+    # minimal OracleConn stub and only exercise the apply loop.
+    monkeypatch.setattr(worker, "_binary_columns", lambda *_a: set())
     monkeypatch.setattr(worker, "_calc_lag", lambda *_args: (0, {"topic-0": 0}))
     monkeypatch.setattr(
         worker.db,
@@ -388,6 +394,9 @@ def test_cdc_thread_marks_failed_after_repeated_poll_errors(monkeypatch):
     monkeypatch.setattr(worker.db, "get_pg_conn", lambda: PgConn())
     monkeypatch.setattr(worker.db, "load_configs", lambda _pg: {"kafka": {"bootstrap_servers": "broker:9092"}})
     monkeypatch.setattr(worker.db, "open_oracle", lambda *_args: OracleConn())
+    # Binary-column detection is covered by test_worker_lob; these tests use a
+    # minimal OracleConn stub and only exercise the apply loop.
+    monkeypatch.setattr(worker, "_binary_columns", lambda *_a: set())
     monkeypatch.setattr(worker.db, "cdc_heartbeat", lambda _pg, mid: calls.append(("heartbeat", mid)))
     monkeypatch.setattr(
         worker.db,
@@ -458,6 +467,9 @@ def test_cdc_thread_marks_failed_on_runtime_fatal_error(monkeypatch):
     monkeypatch.setattr(worker.db, "get_pg_conn", lambda: PgConn())
     monkeypatch.setattr(worker.db, "load_configs", lambda _pg: {"kafka": {"bootstrap_servers": "broker:9092"}})
     monkeypatch.setattr(worker.db, "open_oracle", lambda *_args: OracleConn())
+    # Binary-column detection is covered by test_worker_lob; these tests use a
+    # minimal OracleConn stub and only exercise the apply loop.
+    monkeypatch.setattr(worker, "_binary_columns", lambda *_a: set())
     monkeypatch.setattr(worker, "_parse_debezium", lambda _value: {"op": "u", "after": {"ID": 7}})
     monkeypatch.setattr(worker, "_apply_event", lambda *_args: calls.append(("apply",)))
     monkeypatch.setattr(
