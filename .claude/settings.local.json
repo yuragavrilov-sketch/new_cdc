@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -si --max-time 5 \"http://[::1]:3000/\")",
+      "Bash(powershell -Command \"Invoke-WebRequest -Uri ''http://localhost:3000/'' -TimeoutSec 5 -UseBasicParsing 2>&1 | Select-Object StatusCode,StatusDescription\")",
+      "Bash(npm run:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}

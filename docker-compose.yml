@@ -1,0 +1,74 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Override connection strings / secrets via a .env file in this directory
+# or with `docker compose --env-file my.env up`.
+#
+# Required variables (no defaults provided here):
+#   ORACLE_SOURCE_HOST, ORACLE_SOURCE_PORT, ORACLE_SOURCE_SERVICE,
+#   ORACLE_SOURCE_USER, ORACLE_SOURCE_PASSWORD
+#   ORACLE_TARGET_HOST, ORACLE_TARGET_PORT, ORACLE_TARGET_SERVICE,
+#   ORACLE_TARGET_USER, ORACLE_TARGET_PASSWORD
+#   KAFKA_BOOTSTRAP          e.g. kafka:9092
+#   KAFKA_CONNECT_URL        e.g. http://kafka-connect:8083
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL state DB ─────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       migration_state
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d migration_state"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Coordinator (Flask API + React UI) ──────────────────────────────────────
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+    environment:
+      STATE_DB_DSN: postgresql://postgres:postgres@postgres:5432/migration_state
+      FLASK_DEBUG:  "false"
+    # No secrets here — Oracle / Kafka are configured through the UI Settings page
+    # and persisted in the PostgreSQL service_configs table.
+
+  # ── Worker (bulk load + CDC apply + DDL apply jobs) ─────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      STATE_DB_DSN:       postgresql://postgres:postgres@postgres:5432/migration_state
+      BULK_BATCH_SIZE:    "5000"
+      BULK_POLL_INTERVAL: "5"
+      CDC_BATCH_SIZE:     "500"
+      CDC_CHECKIN_SEC:    "30"
+      CDC_POLL_MS:        "1000"
+      CDC_SCAN_INTERVAL:  "3"
+      WORKER_HEARTBEAT_SEC: "10"
+    # Scale workers horizontally:  docker compose up --scale worker=4
+
+volumes:
+  postgres_data:

@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>{{ title }}</title>
+<style>
+  @page { size: A4 landscape; margin: 12mm; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Segoe UI", Arial, sans-serif; font-size: 11px; color: #1e293b; }
+  h1 { font-size: 16px; margin-bottom: 4px; }
+  .meta { color: #64748b; font-size: 10px; margin-bottom: 14px; }
+  h2 { font-size: 13px; margin: 14px 0 6px; border-bottom: 2px solid #1e293b; padding-bottom: 2px; }
+  h3 { font-size: 11px; margin: 10px 0 4px; color: #475569; }
+
+  /* Summary badges */
+  .summary { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .badge { padding: 3px 8px; border-radius: 4px; font-weight: 700; font-size: 10px; }
+  .badge.ok   { background: #dcfce7; color: #166534; }
+  .badge.warn { background: #fef9c3; color: #854d0e; }
+  .badge.err  { background: #fee2e2; color: #991b1b; }
+
+  /* Tables */
+  table { border-collapse: collapse; width: 100%; margin-bottom: 10px; page-break-inside: auto; }
+  tr { page-break-inside: avoid; }
+  th, td { border: 1px solid #cbd5e1; padding: 3px 6px; text-align: left; font-size: 10px; }
+  th { background: #f1f5f9; font-weight: 700; white-space: nowrap; }
+  .miss { background: #fee2e2; }
+  .extra { background: #fef9c3; }
+  .diff  { background: #fff7ed; }
+  .ok-row { }
+  .disabled { color: #dc2626; font-weight: 700; }
+  .enabled  { color: #16a34a; }
+
+  @media print {
+    body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .no-print { display: none; }
+  }
+  .print-btn {
+    position: fixed; top: 10px; right: 10px; z-index: 999;
+    background: #1d4ed8; color: #fff; border: none; border-radius: 6px;
+    padding: 8px 20px; font-size: 13px; font-weight: 700; cursor: pointer;
+  }
+  .print-btn:hover { background: #2563eb; }
+</style>
+</head>
+<body>
+<button class="print-btn no-print" onclick="window.print()">Печать / PDF</button>
+
+<h1>{{ title }}</h1>
+<div class="meta">
+  Сгенерировано: {{ generated_at }} &nbsp;|&nbsp;
+  Source: {{ src_schema }}.{{ src_table }} &nbsp;→&nbsp;
+  Target: {{ tgt_schema }}.{{ tgt_table }}
+</div>
+
+<!-- ── Summary ────────────────────────────────────────────────────── -->
+<div class="summary">
+  {% if diff.ok %}
+    <span class="badge ok">Схемы совпадают</span>
+  {% else %}
+    <span class="badge err">Расхождений: {{ diff.total }}</span>
+  {% endif %}
+  {% if diff.cols_missing %}<span class="badge err">Колонок нет в target: {{ diff.cols_missing }}</span>{% endif %}
+  {% if diff.cols_extra %}<span class="badge warn">Лишних в target: {{ diff.cols_extra }}</span>{% endif %}
+  {% if diff.cols_type %}<span class="badge warn">Тип не совпадает: {{ diff.cols_type }}</span>{% endif %}
+  {% if diff.idx_missing %}<span class="badge err">Индексов нет в target: {{ diff.idx_missing }}</span>{% endif %}
+  {% if diff.idx_disabled %}<span class="badge warn">Индексов UNUSABLE: {{ diff.idx_disabled }}</span>{% endif %}
+  {% if diff.con_missing %}<span class="badge err">Констрейнтов нет в target: {{ diff.con_missing }}</span>{% endif %}
+  {% if diff.con_disabled %}<span class="badge warn">Констрейнтов DISABLED: {{ diff.con_disabled }}</span>{% endif %}
+  {% if diff.trg_missing %}<span class="badge err">Триггеров нет в target: {{ diff.trg_missing }}</span>{% endif %}
+</div>
+
+<!-- ── Columns ────────────────────────────────────────────────────── -->
+<h2>Колонки ({{ src_cols|length }} в source, {{ tgt_cols|length }} в target)</h2>
+<table>
+  <tr>
+    <th>#</th><th>Колонка</th>
+    <th>Source тип</th><th>Target тип</th>
+    <th>Nullable (S)</th><th>Nullable (T)</th>
+    <th>Default (S)</th><th>Default (T)</th>
+    <th>Статус</th>
+  </tr>
+  {% for row in col_rows %}
+  <tr class="{{ row.css }}">
+    <td>{{ loop.index }}</td>
+    <td><b>{{ row.name }}</b></td>
+    <td>{{ row.src_type }}</td>
+    <td>{{ row.tgt_type }}</td>
+    <td>{{ row.src_null }}</td>
+    <td>{{ row.tgt_null }}</td>
+    <td>{{ row.src_default }}</td>
+    <td>{{ row.tgt_default }}</td>
+    <td>{{ row.status }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<!-- ── Indexes ────────────────────────────────────────────────────── -->
+<h2>Индексы ({{ src_info.indexes|length }} в source, {{ tgt_info.indexes|length }} в target)</h2>
+<table>
+  <tr>
+    <th>Имя</th><th>Тип</th><th>Unique</th><th>Колонки</th>
+    <th>Source</th><th>Target статус</th>
+  </tr>
+  {% for row in idx_rows %}
+  <tr class="{{ row.css }}">
+    <td><b>{{ row.name }}</b></td>
+    <td>{{ row.index_type }}</td>
+    <td>{{ row.unique }}</td>
+    <td>{{ row.columns }}</td>
+    <td>{{ row.in_source }}</td>
+    <td class="{{ 'disabled' if row.tgt_status in ('UNUSABLE','N/A') else '' }}">{{ row.tgt_status }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<!-- ── Constraints ────────────────────────────────────────────────── -->
+<h2>Констрейнты ({{ src_info.constraints|length }} в source, {{ tgt_info.constraints|length }} в target)</h2>
+<table>
+  <tr>
+    <th>Имя</th><th>Тип</th><th>Колонки</th>
+    <th>Source</th><th>Target статус</th>
+  </tr>
+  {% for row in con_rows %}
+  <tr class="{{ row.css }}">
+    <td><b>{{ row.name }}</b></td>
+    <td>{{ row.type }}</td>
+    <td>{{ row.columns }}</td>
+    <td>{{ row.in_source }}</td>
+    <td class="{{ 'disabled' if row.tgt_status == 'DISABLED' else 'enabled' if row.tgt_status == 'ENABLED' else '' }}">{{ row.tgt_status }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<!-- ── Triggers ───────────────────────────────────────────────────── -->
+<h2>Триггеры ({{ src_info.triggers|length }} в source, {{ tgt_info.triggers|length }} в target)</h2>
+<table>
+  <tr>
+    <th>Имя</th><th>Тип</th><th>Событие</th>
+    <th>Source</th><th>Target статус</th>
+  </tr>
+  {% for row in trg_rows %}
+  <tr class="{{ row.css }}">
+    <td><b>{{ row.name }}</b></td>
+    <td>{{ row.trigger_type }}</td>
+    <td>{{ row.event }}</td>
+    <td>{{ row.in_source }}</td>
+    <td class="{{ 'disabled' if row.tgt_status == 'DISABLED' else 'enabled' if row.tgt_status == 'ENABLED' else '' }}">{{ row.tgt_status }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+</body>
+</html>

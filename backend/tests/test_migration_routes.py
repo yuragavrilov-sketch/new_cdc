@@ -1,0 +1,168 @@
+from flask import Flask
+
+from routes import migrations
+
+
+class FullRestartCursorStub:
+    def __init__(self, calls, *, row=("CDC_APPLYING", "task-1"), rowcounts=None):
+        self.calls = calls
+        self.row = row
+        self.rowcounts = list(rowcounts or [3, 1, 2, 4, 1, 1])
+        self.rowcount = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=None):
+        compact_sql = " ".join(sql.split())
+        self.calls.append((compact_sql, params))
+        if compact_sql.startswith(("DELETE", "UPDATE migration_plan_items")):
+            self.rowcount = self.rowcounts.pop(0) if self.rowcounts else 0
+
+    def fetchone(self):
+        return self.row
+
+
+class FullRestartConnStub:
+    def __init__(self, calls, *, row=("CDC_APPLYING", "task-1"), rowcounts=None):
+        self.calls = calls
+        self.row = row
+        self.rowcounts = rowcounts
+
+    def cursor(self):
+        return FullRestartCursorStub(self.calls, row=self.row, rowcounts=self.rowcounts)
+
+    def commit(self):
+        self.calls.append(("COMMIT", None))
+
+    def close(self):
+        self.calls.append(("CLOSE", None))
+
+
+def test_legacy_direct_cdc_creation_error_points_to_schema_screen():
+    message = migrations._legacy_cdc_creation_error()
+
+    assert "Legacy direct CDC migration creation is disabled" in message
+    assert "schema migration screen" in message
+    assert "queued and autostarted" in message
+
+
+def test_create_migration_rejects_direct_cdc_before_db(monkeypatch):
+    app = Flask(__name__)
+    app.register_blueprint(migrations.bp)
+
+    monkeypatch.setitem(migrations._state, "db_available", {"value": True})
+
+    def fail_get_conn():
+        raise AssertionError("CDC direct reject must not open state DB connection")
+
+    monkeypatch.setitem(migrations._state, "get_conn", fail_get_conn)
+
+    res = app.test_client().post("/api/migrations", json={
+        "migration_name": "TCBPAY.ALLORDERS",
+        "strategy": "CDC_DIRECT",
+        "source_schema": "TCBPAY",
+        "source_table": "ALLORDERS",
+        "target_schema": "TCBPAY",
+        "target_table": "ALLORDERS",
+        "group_id": "gid-1",
+    })
+
+    assert res.status_code == 400
+    body = res.get_json()
+    assert "Legacy direct CDC migration creation is disabled" in body["error"]
+    assert "schema migration screen" in body["error"]
+
+
+def test_bulk_create_migrations_rejects_direct_cdc_before_db(monkeypatch):
+    app = Flask(__name__)
+    app.register_blueprint(migrations.bp)
+
+    monkeypatch.setitem(migrations._state, "db_available", {"value": True})
+
+    def fail_get_conn():
+        raise AssertionError("CDC bulk reject must not open state DB connection")
+
+    monkeypatch.setitem(migrations._state, "get_conn", fail_get_conn)
+
+    res = app.test_client().post("/api/migrations/bulk", json={
+        "strategy": "CDC_STAGE",
+        "group_id": "gid-1",
+        "tables": [{
+            "source_schema": "TCBPAY",
+            "source_table": "ALLORDERS",
+            "target_schema": "TCBPAY",
+            "target_table": "ALLORDERS",
+        }],
+    })
+
+    assert res.status_code == 400
+    body = res.get_json()
+    assert "Legacy direct CDC migration creation is disabled" in body["error"]
+    assert "schema migration screen" in body["error"]
+
+
+def test_full_restart_resets_migration_to_draft(monkeypatch):
+    app = Flask(__name__)
+    app.register_blueprint(migrations.bp)
+    calls = []
+    broadcasts = []
+
+    monkeypatch.setitem(migrations._state, "db_available", {"value": True})
+    monkeypatch.setitem(migrations._state, "get_conn", lambda: FullRestartConnStub(calls))
+    monkeypatch.setitem(migrations._state, "broadcast", lambda event: broadcasts.append(event))
+
+    res = app.test_client().post("/api/migrations/mid-1/full-restart", json={})
+
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["ok"] is True
+    assert body["from_phase"] == "CDC_APPLYING"
+    assert body["to_phase"] == "DRAFT"
+    assert body["started"] is False
+    assert body["deleted_chunks"] == 3
+    assert body["deleted_cdc_state"] == 1
+    assert body["deleted_index_jobs"] == 2
+    assert body["deleted_trigger_jobs"] == 4
+    assert body["deleted_compare_tasks"] == 1
+    assert body["updated_plan_items"] == 1
+    assert broadcasts[-1]["phase"] == "DRAFT"
+    assert any("DELETE FROM migration_chunks" in sql for sql, _params in calls)
+    assert any("DELETE FROM migration_cdc_state" in sql for sql, _params in calls)
+    assert any("DELETE FROM target_index_jobs" in sql for sql, _params in calls)
+    assert any("DELETE FROM target_trigger_jobs" in sql for sql, _params in calls)
+    assert any("UPDATE migrations SET phase" in sql for sql, _params in calls)
+
+
+def test_full_restart_can_start_migration_immediately(monkeypatch):
+    app = Flask(__name__)
+    app.register_blueprint(migrations.bp)
+    calls = []
+    broadcasts = []
+
+    monkeypatch.setitem(migrations._state, "db_available", {"value": True})
+    monkeypatch.setitem(
+        migrations._state,
+        "get_conn",
+        lambda: FullRestartConnStub(calls, row=("FAILED", None), rowcounts=[0, 0, 0, 0, 1]),
+    )
+    monkeypatch.setitem(migrations._state, "broadcast", lambda event: broadcasts.append(event))
+
+    res = app.test_client().post("/api/migrations/mid-1/full-restart", json={"start": True})
+
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["ok"] is True
+    assert body["from_phase"] == "FAILED"
+    assert body["to_phase"] == "NEW"
+    assert body["started"] is True
+    assert body["deleted_compare_tasks"] == 0
+    assert body["updated_plan_items"] == 1
+    assert broadcasts[-1]["phase"] == "NEW"
+    assert any(
+        sql.startswith("UPDATE migration_plan_items") and params == ("RUNNING", "mid-1")
+        for sql, params in calls
+    )

@@ -1,0 +1,51 @@
+# ── Stage 1: build React frontend ────────────────────────────────────────────
+FROM node:20-alpine AS frontend-build
+
+WORKDIR /build
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm config set strict-ssl false \
+ && NODE_ENV=development npm ci
+COPY frontend/ ./
+RUN npm run build          # → /build/dist
+
+
+# ── Stage 2: Python / Flask coordinator ──────────────────────────────────────
+FROM python:3.11-slim
+
+# System deps (psycopg2-binary is a wheel, nothing extra needed;
+# oracledb thin mode needs no Oracle Instant Client)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY backend/requirements.txt ./
+RUN pip install --no-cache-dir \
+        --trusted-host pypi.org \
+        --trusted-host files.pythonhosted.org \
+        -r requirements.txt
+
+# Copy application code
+COPY backend/ ./backend/
+
+# Copy React build output where Flask expects it
+COPY --from=frontend-build /build/dist ./frontend/dist/
+
+# Default environment (override via docker-compose / -e flags)
+ENV FLASK_HOST=0.0.0.0 \
+    FLASK_PORT=5000 \
+    FLASK_DEBUG=false \
+    STATE_DB_DSN=postgresql://postgres:postgres@postgres:5432/migration_state
+
+EXPOSE 5000
+
+# Use gunicorn for production; single worker is fine because we use threads
+CMD ["gunicorn", \
+     "--chdir", "backend", \
+     "--bind", "0.0.0.0:5000", \
+     "--workers", "1", \
+     "--threads", "8", \
+     "--timeout", "120", \
+     "app:app"]

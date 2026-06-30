@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>{{ title }}</title>
+<style>
+  @page { size: A4 landscape; margin: 12mm; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Segoe UI", Arial, sans-serif; font-size: 11px; color: #1e293b; }
+  h1 { font-size: 16px; margin-bottom: 2px; }
+  .meta { color: #64748b; font-size: 10px; margin-bottom: 14px; }
+  h2 { font-size: 13px; margin: 16px 0 6px; border-bottom: 2px solid #1e293b; padding-bottom: 2px; }
+
+  /* Summary cards */
+  .totals { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .card { padding: 6px 14px; border-radius: 6px; font-weight: 700; font-size: 12px; }
+  .card.green  { background: #dcfce7; color: #166534; }
+  .card.yellow { background: #fef9c3; color: #854d0e; }
+  .card.red    { background: #fee2e2; color: #991b1b; }
+  .card.gray   { background: #f1f5f9; color: #475569; }
+
+  /* Main table */
+  table { border-collapse: collapse; width: 100%; margin-bottom: 10px; page-break-inside: auto; }
+  tr { page-break-inside: avoid; }
+  th, td { border: 1px solid #cbd5e1; padding: 4px 8px; text-align: center; font-size: 10px; }
+  th { background: #f1f5f9; font-weight: 700; white-space: nowrap; }
+  td.tname { text-align: left; font-weight: 600; }
+  .row-ok   { }
+  .row-diff { background: #fff7ed; }
+  .row-err  { background: #fee2e2; }
+  .row-miss { background: #f1f5f9; color: #94a3b8; }
+  .cnt-bad  { color: #dc2626; font-weight: 700; }
+  .cnt-warn { color: #d97706; font-weight: 700; }
+  .cnt-ok   { color: #16a34a; }
+  .badge-ok { display: inline-block; padding: 1px 6px; border-radius: 3px; background: #dcfce7; color: #166534; font-size: 9px; font-weight: 700; }
+  .badge-err { display: inline-block; padding: 1px 6px; border-radius: 3px; background: #fee2e2; color: #991b1b; font-size: 9px; font-weight: 700; }
+  .badge-warn { display: inline-block; padding: 1px 6px; border-radius: 3px; background: #fef9c3; color: #854d0e; font-size: 9px; font-weight: 700; }
+  .badge-miss { display: inline-block; padding: 1px 6px; border-radius: 3px; background: #e2e8f0; color: #64748b; font-size: 9px; font-weight: 700; }
+
+  /* Detail tables per pair */
+  .pair-detail { page-break-before: always; }
+  .pair-detail:first-of-type { page-break-before: auto; }
+  h3 { font-size: 12px; margin: 10px 0 4px; color: #334155; }
+  .detail-tbl th { font-size: 9px; }
+  .detail-tbl td { font-size: 9px; text-align: left; }
+  .miss-cell { background: #fee2e2; }
+  .extra-cell { background: #fef9c3; }
+  .diff-cell { background: #fff7ed; }
+
+  @media print {
+    body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .no-print { display: none; }
+  }
+  .print-btn {
+    position: fixed; top: 10px; right: 10px; z-index: 999;
+    background: #1d4ed8; color: #fff; border: none; border-radius: 6px;
+    padding: 8px 20px; font-size: 13px; font-weight: 700; cursor: pointer;
+  }
+  .print-btn:hover { background: #2563eb; }
+</style>
+</head>
+<body>
+<button class="print-btn no-print" onclick="window.print()">Печать / PDF</button>
+
+<h1>{{ title }}</h1>
+<div class="meta">
+  Сгенерировано: {{ generated_at }} &nbsp;|&nbsp;
+  Source: {{ src_schema }} &nbsp;→&nbsp; Target: {{ tgt_schema }}
+  &nbsp;|&nbsp; Таблиц: {{ total_tables }}, сравнено: {{ compared_count }}
+</div>
+
+<!-- ── Totals ──────────────────────────────────────────────────────── -->
+<div class="totals">
+  <span class="card green">OK: {{ ok_count }}</span>
+  <span class="card red">С расхождениями: {{ diff_count }}</span>
+  {% if error_count %}<span class="card yellow">Ошибок: {{ error_count }}</span>{% endif %}
+  {% if no_target_count %}<span class="card gray">Нет в target: {{ no_target_count }}</span>{% endif %}
+</div>
+
+<!-- ── Summary table ──────────────────────────────────────────────── -->
+<h2>Сводная таблица</h2>
+<table>
+  <tr>
+    <th>Таблица</th>
+    <th>Статус</th>
+    <th>Кол. нет</th>
+    <th>Кол. лишн.</th>
+    <th>Кол. тип</th>
+    <th>Инд. нет</th>
+    <th>Инд. UNUSABLE</th>
+    <th>Конст. нет</th>
+    <th>Конст. DISABLED</th>
+    <th>Триг. нет</th>
+    <th>Итого</th>
+  </tr>
+  {% for row in summary_rows %}
+  <tr class="{{ row.css }}">
+    <td class="tname">{{ row.table }}</td>
+    <td><span class="badge-{{ row.badge }}">{{ row.status_text }}</span></td>
+    <td class="{{ 'cnt-bad' if row.d.cols_missing else 'cnt-ok' }}">{{ row.d.cols_missing }}</td>
+    <td class="{{ 'cnt-warn' if row.d.cols_extra else 'cnt-ok' }}">{{ row.d.cols_extra }}</td>
+    <td class="{{ 'cnt-warn' if row.d.cols_type else 'cnt-ok' }}">{{ row.d.cols_type }}</td>
+    <td class="{{ 'cnt-bad' if row.d.idx_missing else 'cnt-ok' }}">{{ row.d.idx_missing }}</td>
+    <td class="{{ 'cnt-warn' if row.d.idx_disabled else 'cnt-ok' }}">{{ row.d.idx_disabled }}</td>
+    <td class="{{ 'cnt-bad' if row.d.con_missing else 'cnt-ok' }}">{{ row.d.con_missing }}</td>
+    <td class="{{ 'cnt-warn' if row.d.con_disabled else 'cnt-ok' }}">{{ row.d.con_disabled }}</td>
+    <td class="{{ 'cnt-bad' if row.d.trg_missing else 'cnt-ok' }}">{{ row.d.trg_missing }}</td>
+    <td class="{{ 'cnt-bad' if row.d.total else 'cnt-ok' }}"><b>{{ row.d.total }}</b></td>
+  </tr>
+  {% endfor %}
+</table>
+
+<!-- ── Per-table detail (only for tables with diffs) ──────────────── -->
+{% for pair in detail_pairs %}
+<div class="pair-detail">
+  <h2>{{ pair.table }} — расхождения ({{ pair.diff.total }})</h2>
+
+  {% if pair.col_rows %}
+  <h3>Колонки</h3>
+  <table class="detail-tbl">
+    <tr><th>Колонка</th><th>Source тип</th><th>Target тип</th><th>Проблема</th></tr>
+    {% for c in pair.col_rows %}
+    <tr class="{{ c.css }}-cell">
+      <td><b>{{ c.name }}</b></td><td>{{ c.src_type }}</td><td>{{ c.tgt_type }}</td><td>{{ c.status }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  {% if pair.idx_rows %}
+  <h3>Индексы</h3>
+  <table class="detail-tbl">
+    <tr><th>Имя</th><th>Колонки</th><th>Проблема</th></tr>
+    {% for i in pair.idx_rows %}
+    <tr class="{{ i.css }}-cell">
+      <td><b>{{ i.name }}</b></td><td>{{ i.columns }}</td><td>{{ i.status }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  {% if pair.con_rows %}
+  <h3>Констрейнты</h3>
+  <table class="detail-tbl">
+    <tr><th>Имя</th><th>Тип</th><th>Колонки</th><th>Проблема</th></tr>
+    {% for c in pair.con_rows %}
+    <tr class="{{ c.css }}-cell">
+      <td><b>{{ c.name }}</b></td><td>{{ c.type }}</td><td>{{ c.columns }}</td><td>{{ c.status }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  {% if pair.trg_rows %}
+  <h3>Триггеры</h3>
+  <table class="detail-tbl">
+    <tr><th>Имя</th><th>Проблема</th></tr>
+    {% for t in pair.trg_rows %}
+    <tr class="{{ t.css }}-cell">
+      <td><b>{{ t.name }}</b></td><td>{{ t.status }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</div>
+{% endfor %}
+
+</body>
+</html>

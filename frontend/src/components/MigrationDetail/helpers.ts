@@ -1,0 +1,41 @@
+/** Shared phase sets and predicates used by MigrationDetail tabs. */
+import { Strategy, hasCdc } from "../../types/migration";
+
+export const BULK_PHASES = new Set([
+  "CHUNKING", "BULK_LOADING", "BULK_LOADED",
+  "BASELINE_LOADING", "DATA_VERIFYING",
+]);
+
+export const CONNECTOR_PHASES = new Set([
+  "SCN_FIXED", "CONNECTOR_STARTING", "CDC_BUFFERING",
+  "CHUNKING", "BULK_LOADING", "BULK_LOADED",
+  "STAGE_VALIDATING", "STAGE_VALIDATED",
+  "BASELINE_PUBLISHING", "BASELINE_PUBLISHED",
+  "CDC_APPLY_STARTING", "CDC_CATCHING_UP", "CDC_CAUGHT_UP", "STEADY_STATE",
+]);
+
+export const LAG_PHASES = new Set([
+  "CDC_APPLY_STARTING", "CDC_CATCHING_UP", "CDC_CAUGHT_UP", "STEADY_STATE",
+]);
+
+export const VALIDATION_PHASES = new Set([
+  "STAGE_VALIDATED", "BASELINE_PUBLISHING", "BASELINE_PUBLISHED",
+  "CDC_APPLY_STARTING", "CDC_CATCHING_UP", "CDC_CAUGHT_UP", "STEADY_STATE",
+]);
+
+export const TERMINAL_PHASES = new Set(["COMPLETED", "CANCELLED", "FAILED"]);
+
+export const ACTIVE_PHASES = new Set([
+  "NEW", "PREPARING", "SCN_FIXED", "CONNECTOR_STARTING", "CDC_BUFFERING",
+  "CHUNKING", "BULK_LOADING", "BULK_LOADED",
+  "STAGE_VALIDATING", "STAGE_VALIDATED",
+  "BASELINE_PUBLISHING", "BASELINE_LOADING", "BASELINE_PUBLISHED",
+  "STAGE_DROPPING", "INDEXES_ENABLING",
+  "CDC_APPLY_STARTING", "CDC_CATCHING_UP", "CDC_CAUGHT_UP", "STEADY_STATE",
+]);
+
+export const DELETABLE_PHASES = new Set(["DRAFT", "CANCELLING", "CANCELLED", "FAILED"]);
+
+export function isCdcMode(detail: { strategy?: Strategy }): boolean {
+  return detail.strategy ? hasCdc(detail.strategy) : true;
+}

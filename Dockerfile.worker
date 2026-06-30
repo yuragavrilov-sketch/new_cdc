@@ -1,0 +1,30 @@
+# Worker — bulk loading + CDC apply
+# oracledb 2.x runs in thin mode by default: no Oracle Instant Client needed.
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 \
+        libsnappy1v5 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/workers
+
+COPY workers/requirements.txt ./
+RUN pip install --no-cache-dir \
+        --trusted-host pypi.org \
+        --trusted-host files.pythonhosted.org \
+        -r requirements.txt
+
+COPY workers/ ./
+
+# Default environment (override via docker-compose / -e flags)
+ENV STATE_DB_DSN=postgresql://postgres:postgres@postgres:5432/migration_state \
+    BULK_BATCH_SIZE=5000 \
+    BULK_POLL_INTERVAL=5 \
+    CDC_BATCH_SIZE=500 \
+    CDC_CHECKIN_SEC=30 \
+    CDC_POLL_MS=1000 \
+    CDC_SCAN_INTERVAL=3 \
+    WORKER_HEARTBEAT_SEC=10
+
+CMD ["python", "worker.py"]
