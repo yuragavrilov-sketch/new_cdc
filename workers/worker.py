@@ -186,14 +186,26 @@ def _process_baseline_chunk(chunk: dict, pg_conn, configs: dict) -> int:
     rows_loaded = 0
     try:
         with dst_conn.cursor() as cur:
-            # Enable parallel DML for this session so the PARALLEL hint is honoured.
-            cur.execute("ALTER SESSION ENABLE PARALLEL DML")
-            # APPEND   — direct-path insert (skips buffer cache, skips redo when
-            #            the table is in NOLOGGING mode set by baseline_publishing).
-            # PARALLEL — Oracle may spawn parallel servers for both the INSERT and
-            #            the SELECT scan of the stage table.
+            # Conventional (non-direct-path) INSERT so multiple workers write into
+            # the target table CONCURRENTLY.
+            #
+            # A direct-path insert (/*+ APPEND */ or parallel DML) takes an
+            # EXCLUSIVE table lock (TM enqueue, mode 6) held until COMMIT, which
+            # serialises every baseline chunk across workers and silently defeats
+            # baseline_parallel_degree — only one chunk inserts at a time even
+            # though several are CLAIMED.  See services/oracle_baseline.py for the
+            # same reasoning.
+            #
+            # PARALLEL stays on the SELECT only: a parallel *query* speeds the
+            # stage scan and does NOT take the exclusive insert lock, so it is
+            # safe under concurrent writers.
+            #
+            # Trade-off: conventional INSERT generates redo even though
+            # baseline_publishing set the table NOLOGGING (NOLOGGING only affects
+            # direct-path operations).  Concurrency across workers is preferred
+            # over the redo savings of a single serialised direct-path load.
             cur.execute(
-                f'INSERT /*+ APPEND PARALLEL(tgt, DEFAULT) */ INTO {tgt} tgt '
+                f'INSERT INTO {tgt} tgt '
                 f'SELECT /*+ PARALLEL(stg, DEFAULT) */ * FROM {stg} stg '
                 f'WHERE stg.ROWID BETWEEN CHARTOROWID(:rs) AND CHARTOROWID(:re)',
                 {"rs": rowid_start, "re": rowid_end},
