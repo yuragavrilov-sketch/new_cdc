@@ -987,11 +987,8 @@ def add_plan_items(sm_id: str):
                 group_row = cur.fetchone()
                 if not group_row:
                     return jsonify({"error": "CDC pack not found"}), 400
-                connector_group_status, group_topic_prefix, group_run_id = group_row
-                active_topic_prefix = (
-                    f"{group_topic_prefix}.{group_run_id}"
-                    if group_run_id else group_topic_prefix
-                )
+                connector_group_status, group_topic_prefix, _group_run_id = group_row
+                active_topic_prefix = group_topic_prefix
             else:
                 active_topic_prefix = None
 

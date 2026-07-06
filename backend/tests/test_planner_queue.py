@@ -213,7 +213,7 @@ def test_group_message_key_columns_uses_non_pk_tables():
     )
 
 
-def test_cdc_group_snapshot_uses_active_run_topic_names(monkeypatch):
+def test_cdc_group_snapshot_uses_stable_data_topic_names(monkeypatch):
     class CursorStub:
         def __init__(self):
             self.query = ""
@@ -257,8 +257,8 @@ def test_cdc_group_snapshot_uses_active_run_topic_names(monkeypatch):
     snapshot = planner._load_cdc_group_snapshot(CursorStub(), "gid")
 
     assert snapshot["active_connector_name"] == "base_connector_r123ab"
-    assert snapshot["active_topic_prefix"] == "base.topic.r123ab"
-    assert snapshot["tables"][0]["topic_name"] == "base.topic.r123ab.TCBPAY.ALLORDERS"
+    assert snapshot["active_topic_prefix"] == "base.topic"
+    assert snapshot["tables"][0]["topic_name"] == "base.topic.TCBPAY.ALLORDERS"
 
 
 def test_get_plan_includes_cdc_worker_state(monkeypatch):

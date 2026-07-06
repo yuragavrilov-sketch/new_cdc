@@ -55,10 +55,8 @@ def _active_connector_name(group: dict) -> str:
 
 
 def _active_topic_prefix(group: dict) -> str:
-    """Topic prefix for the current run: base_prefix + '.' + run_id."""
-    run_id = group.get("run_id") or ""
-    base = group["topic_prefix"]
-    return f"{base}.{run_id}" if run_id else base
+    """Stable data-topic prefix for all runs of the group."""
+    return group["topic_prefix"]
 
 
 def _schema_topic_name(group: dict) -> str:
@@ -990,11 +988,7 @@ def request_start(group_id: str) -> dict:
                 UPDATE connector_groups SET run_id = %s, updated_at = NOW()
                 WHERE group_id = %s
             """, (run_id, group_id))
-            _sync_persisted_topic_names(
-                cur,
-                group_id,
-                f"{group['topic_prefix']}.{run_id}",
-            )
+            _sync_persisted_topic_names(cur, group_id, group["topic_prefix"])
         conn.commit()
     finally:
         conn.close()

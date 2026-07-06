@@ -1594,7 +1594,7 @@ def test_connector_group_key_columns_include_unique_keys(monkeypatch):
     )
 
 
-def test_connector_group_topic_creation_uses_active_run_topic_names(monkeypatch):
+def test_connector_group_topic_creation_uses_stable_data_topic_names(monkeypatch):
     from services import kafka_topics
 
     created_topics = []
@@ -1668,10 +1668,10 @@ def test_connector_group_topic_creation_uses_active_run_topic_names(monkeypatch)
     )
 
     assert connector_groups.create_group_topics("gid-1") == [
-        {"topic_name": "base.topic.r123ab.TCBPAY.MERCHANTS_ORDERS", "status": "ok"},
+        {"topic_name": "base.topic.TCBPAY.MERCHANTS_ORDERS", "status": "ok"},
     ]
     assert created_topics == [
-        (["k:9092"], "base.topic.r123ab.TCBPAY.MERCHANTS_ORDERS"),
+        (["k:9092"], "base.topic.TCBPAY.MERCHANTS_ORDERS"),
     ]
 
 
@@ -1728,7 +1728,7 @@ def test_connector_group_request_start_syncs_persisted_topic_names(monkeypatch):
         "status": "TOPICS_CREATING",
         "run_id": "r123ab",
     }
-    assert ("sync", "gid-1", "base.topic.r123ab") in calls
+    assert ("sync", "gid-1", "base.topic") in calls
     assert any(call[:3] == ("transition", "gid-1", "TOPICS_CREATING") for call in calls)
 
 
@@ -2029,10 +2029,10 @@ def test_orchestrator_syncs_cdc_runtime_context_from_group(monkeypatch):
     assert updates == {
         "migration_id": "mid-1",
         "connector_name": "sm_tcbpay_pay_connector_r123ab",
-        "topic_prefix": "sm.tcbpay.pay.r123ab",
+        "topic_prefix": "sm.tcbpay.pay",
         "consumer_group": "sm.tcbpay.pay_TCBPAY_ALLORDERS",
     }
-    assert result["topic_prefix"] == "sm.tcbpay.pay.r123ab"
+    assert result["topic_prefix"] == "sm.tcbpay.pay"
 
 
 def test_orchestrator_creates_manual_trigger_job_when_cdc_catches_up(monkeypatch):
@@ -2637,7 +2637,7 @@ def test_orchestrator_starts_new_cdc_migration_when_group_running(monkeypatch):
         lambda mid, m, group: calls.append(("runtime", mid, group["run_id"])) or {
             **m,
             "connector_name": "cdc-main_r123ab",
-            "topic_prefix": "cdc.topic.r123ab",
+            "topic_prefix": "cdc.topic",
             "consumer_group": "cdc.consumer_TCBPAY_ALLORDERS",
         },
     )
