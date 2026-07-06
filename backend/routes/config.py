@@ -25,7 +25,7 @@ def init(db_available_ref, mem_configs, service_status, status_lock, broadcast_f
     _state["checkers"]      = checkers
 
 
-_ALLOWED = {"oracle_source", "oracle_target", "kafka", "kafka_connect"}
+_ALLOWED = {"oracle_source", "oracle_target", "kafka", "kafka_connect", "runtime"}
 _SECRET_KEYS = {"password", "owner_password"}
 _SECRET_MASK = "********"
 
@@ -121,7 +121,9 @@ def test_config_route(service: str):
 
 
 def _check_and_broadcast(service: str) -> None:
-    checker = _state["checkers"][service]
+    checker = _state["checkers"].get(service)
+    if checker is None:
+        return
     cfg = _state["load_configs"]().get(service, {})
     try:
         status, message = checker(cfg)

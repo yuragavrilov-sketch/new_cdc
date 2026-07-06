@@ -418,7 +418,20 @@ def _plan_status_without_pending(active_count: int, failed_count: int, cancelled
 
 
 def _configs() -> dict:
-    return _state["load_configs"]()
+    load_configs = _state.get("load_configs")
+    return load_configs() if load_configs else {}
+
+
+def _positive_int(value, default: int = 1) -> int:
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _cdc_parallel_migrations_limit() -> int:
+    runtime_cfg = (_configs().get("runtime") or {})
+    return _positive_int(runtime_cfg.get("cdc_parallel_migrations"), 1)
 
 
 def _oracle_cfg(connection_id: str) -> dict:
@@ -590,6 +603,7 @@ def _update_queue_positions() -> None:
     yet. They wait for the connector lifecycle and must not block other NEW
     migrations. CDC and non-CDC migrations use independent load slots.
     """
+    cdc_limit = _cdc_parallel_migrations_limit()
     conn = _state["get_conn"]()
     try:
         with conn.cursor() as cur:
@@ -601,11 +615,12 @@ def _update_queue_positions() -> None:
                             WHERE phase = ANY(%s)
                               AND LEFT(COALESCE(strategy, ''), 4) <> 'CDC_'
                         ) AS bulk_busy,
-                        EXISTS (
-                            SELECT 1 FROM migrations
+                        (
+                            SELECT COUNT(*)
+                            FROM migrations
                             WHERE phase = ANY(%s)
                               AND LEFT(COALESCE(strategy, ''), 4) = 'CDC_'
-                        ) AS cdc_busy
+                        ) AS cdc_active_count
                 ),
                 candidates AS (
                     SELECT m.migration_id,
@@ -625,7 +640,11 @@ def _update_queue_positions() -> None:
                 desired AS (
                     SELECT c.migration_id,
                            CASE
-                             WHEN c.is_cdc AND a.cdc_busy THEN c.pos
+                             WHEN c.is_cdc THEN
+                               CASE
+                                 WHEN c.pos <= GREATEST(%s - a.cdc_active_count, 0) THEN NULL
+                                 ELSE c.pos - GREATEST(%s - a.cdc_active_count, 0)
+                               END
                              WHEN NOT c.is_cdc AND a.bulk_busy THEN c.pos
                              WHEN c.pos = 1 THEN NULL
                              ELSE c.pos - 1
@@ -638,7 +657,7 @@ def _update_queue_positions() -> None:
                 FROM   desired
                 WHERE  m.migration_id = desired.migration_id
                   AND  m.queue_position IS DISTINCT FROM desired.queue_position
-            """, (list(_HEAVY_PHASES), list(_HEAVY_PHASES)))
+            """, (list(_HEAVY_PHASES), list(_HEAVY_PHASES), cdc_limit, cdc_limit))
 
             # Clear stale queue_position on non-NEW or non-runnable NEW migrations.
             cur.execute("""
@@ -758,7 +777,8 @@ def _maybe_reconcile_deferred_fks() -> None:
 
 
 def _kick_new_migrations_for_group(group_id: str) -> None:
-    """Try to process the first NEW CDC migration for a just-running group."""
+    """Try to process queued NEW CDC migrations for a just-running group."""
+    limit = _cdc_parallel_migrations_limit()
     conn = _state["get_conn"]()
     try:
         with conn.cursor() as cur:
@@ -769,8 +789,8 @@ def _kick_new_migrations_for_group(group_id: str) -> None:
                   AND  m.phase = 'NEW'
                   AND  LEFT(COALESCE(m.strategy, ''), 4) = 'CDC_'
                 ORDER BY m.state_changed_at ASC
-                LIMIT  1
-            """, (group_id,))
+                LIMIT  %s
+            """, (group_id, limit))
             rows = [row_to_dict(cur, r) for r in cur.fetchall()]
     finally:
         conn.close()
@@ -1616,19 +1636,22 @@ def _handle_new(mid: str, m: dict) -> None:
 
     # Queue gate. Bulk and CDC use independent slots.
     is_cdc = strategy.has_cdc
+    lane_limit = _cdc_parallel_migrations_limit() if is_cdc else 1
     conn = _state["get_conn"]()
     try:
         with conn.cursor() as cur:
             placeholders = ",".join(["%s"] * len(_HEAVY_PHASES))
             cur.execute(
-                f"""SELECT 1 FROM migrations
+                f"""SELECT COUNT(*) FROM migrations
                     WHERE  phase IN ({placeholders})
                       AND  (LEFT(COALESCE(strategy, ''), 4) = 'CDC_') = %s
                       AND  migration_id != %s
-                    LIMIT 1""",
+                """,
                 (*_HEAVY_PHASES, is_cdc, mid),
             )
-            slot_busy = cur.fetchone() is not None
+            row = cur.fetchone()
+            active_heavy = int(row[0]) if row and row[0] is not None else 0
+            slot_busy = active_heavy >= lane_limit
     finally:
         conn.close()
 
@@ -1642,27 +1665,35 @@ def _handle_new(mid: str, m: dict) -> None:
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT m.migration_id
-                FROM   migrations m
-                LEFT JOIN connector_groups cg ON cg.group_id = m.group_id
-                WHERE  m.phase = 'NEW'
-                  AND  (LEFT(COALESCE(m.strategy, ''), 4) = 'CDC_') = %s
-                  AND  (
-                        LEFT(COALESCE(m.strategy, ''), 4) <> 'CDC_'
-                        OR cg.status = 'RUNNING'
-                  )
-                ORDER BY m.state_changed_at ASC
-                LIMIT 1
-            """, (is_cdc,))
-            first = cur.fetchone()
+                WITH runnable AS (
+                    SELECT m.migration_id,
+                           ROW_NUMBER() OVER (
+                               ORDER BY m.state_changed_at ASC, m.migration_id ASC
+                           ) AS pos
+                    FROM   migrations m
+                    LEFT JOIN connector_groups cg ON cg.group_id = m.group_id
+                    WHERE  m.phase = 'NEW'
+                      AND  (LEFT(COALESCE(m.strategy, ''), 4) = 'CDC_') = %s
+                      AND  (
+                            LEFT(COALESCE(m.strategy, ''), 4) <> 'CDC_'
+                            OR cg.status = 'RUNNING'
+                      )
+                )
+                SELECT pos
+                FROM   runnable
+                WHERE  migration_id = %s
+            """, (is_cdc, mid))
+            row = cur.fetchone()
+            runnable_position = int(row[0]) if row and row[0] is not None else None
     finally:
         conn.close()
 
-    if first and first[0] != mid:
+    available_slots = max(lane_limit - active_heavy, 0)
+    if runnable_position is None or runnable_position > available_slots:
         lane = "CDC" if is_cdc else "bulk"
         print(
-            f"[orchestrator] {mid}: waiting for earlier {lane} NEW migration "
-            f"{first[0]}; migration remains NEW"
+            f"[orchestrator] {mid}: waiting for earlier {lane} NEW migrations; "
+            f"position={runnable_position}, available_slots={available_slots}"
         )
         _update_queue_positions()
         return

@@ -23,6 +23,7 @@ def make_client(monkeypatch, *, token: str = ""):
         "oracle_target": {},
         "kafka": {"bootstrap_servers": "broker:9092"},
         "kafka_connect": {"url": "http://connect:8083"},
+        "runtime": {"cdc_parallel_migrations": 1},
     }
 
     def load_configs():
@@ -93,3 +94,16 @@ def test_connection_test_resolves_secret_mask_before_checker(monkeypatch):
 
     assert response.status_code == 200
     assert response.get_json() == {"status": "up", "message": "source-secret"}
+
+
+def test_runtime_config_can_be_saved_online(monkeypatch):
+    client, store = make_client(monkeypatch, token="secret-token")
+
+    response = client.post(
+        "/api/config/runtime",
+        json={"cdc_parallel_migrations": 3},
+        headers={"X-Config-Token": "secret-token"},
+    )
+
+    assert response.status_code == 200
+    assert store["runtime"] == {"cdc_parallel_migrations": 3}

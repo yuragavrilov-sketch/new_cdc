@@ -67,11 +67,16 @@ interface ConnectConfig {
   url: string;
 }
 
+interface RuntimeConfig {
+  cdc_parallel_migrations: number;
+}
+
 interface AllConfigs {
   oracle_source: OracleConfig;
   oracle_target: OracleConfig;
   kafka: KafkaConfig;
   kafka_connect: ConnectConfig;
+  runtime: RuntimeConfig;
 }
 
 const ORACLE_DEFAULT: OracleConfig = {
@@ -80,14 +85,16 @@ const ORACLE_DEFAULT: OracleConfig = {
 };
 const KAFKA_DEFAULT: KafkaConfig   = { bootstrap_servers: "" };
 const CONNECT_DEFAULT: ConnectConfig = { url: "" };
+const RUNTIME_DEFAULT: RuntimeConfig = { cdc_parallel_migrations: 1 };
 
-type TabKey = "oracle_source" | "oracle_target" | "kafka" | "kafka_connect";
+type TabKey = "oracle_source" | "oracle_target" | "kafka" | "kafka_connect" | "runtime";
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: "oracle_source", label: "Oracle Source" },
   { key: "oracle_target", label: "Oracle Target" },
   { key: "kafka",         label: "Kafka"         },
   { key: "kafka_connect", label: "Connect"       },
+  { key: "runtime",       label: "Runtime"       },
 ];
 
 const CONFIG_TOKEN_KEY = "coordinator.configApiToken";
@@ -147,6 +154,7 @@ export function SettingsModal({ onClose }: Props) {
     oracle_target: { ...ORACLE_DEFAULT },
     kafka:         { ...KAFKA_DEFAULT },
     kafka_connect: { ...CONNECT_DEFAULT },
+    runtime:       { ...RUNTIME_DEFAULT },
   });
   const [saving,      setSaving]      = useState(false);
   const [saved,       setSaved]       = useState(false);
@@ -172,6 +180,7 @@ export function SettingsModal({ onClose }: Props) {
           oracle_target: { ...ORACLE_DEFAULT, ...(data.oracle_target ?? {}) },
           kafka:         { ...KAFKA_DEFAULT,  ...(data.kafka         ?? {}) },
           kafka_connect: { ...CONNECT_DEFAULT,...(data.kafka_connect ?? {}) },
+          runtime:       { ...RUNTIME_DEFAULT,...(data.runtime       ?? {}) },
         });
         setError(null);
       })
@@ -219,6 +228,10 @@ export function SettingsModal({ onClose }: Props) {
 
   function setOracle(key: "oracle_source" | "oracle_target", field: keyof OracleConfig, v: string) {
     setConfigs((p) => ({ ...p, [key]: { ...p[key], [field]: v } }));
+  }
+
+  function setRuntime(field: keyof RuntimeConfig, value: number) {
+    setConfigs((p) => ({ ...p, runtime: { ...p.runtime, [field]: Math.max(1, Math.floor(value || 1)) } }));
   }
 
   function updateConfigToken(v: string) {
@@ -371,6 +384,18 @@ export function SettingsModal({ onClose }: Props) {
           </div>
         )}
 
+        {activeTab === "runtime" && (
+          <div>
+            <Field
+              label="CDC parallel migrations"
+              type="number"
+              value={String(configs.runtime.cdc_parallel_migrations ?? 1)}
+              onChange={(v) => setRuntime("cdc_parallel_migrations", Number(v))}
+              placeholder="1"
+            />
+          </div>
+        )}
+
         {/* Test result */}
         {testResult && (
           <div style={{
@@ -432,6 +457,13 @@ function ServiceMetricsPanel({
   tab:   TabKey;
   data:  ServicesMetrics | null;
 }) {
+  if (tab === "runtime") {
+    return (
+      <div style={metricsBoxStyle}>
+        <span style={{ color: t.text.muted, fontSize: 11 }}>Coordinator runtime</span>
+      </div>
+    );
+  }
   if (!data) {
     return (
       <div style={metricsBoxStyle}>

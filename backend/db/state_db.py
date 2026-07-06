@@ -33,6 +33,7 @@ _mem_configs: dict = {
     "oracle_target": {},
     "kafka": {},
     "kafka_connect": {},
+    "runtime": {"cdc_parallel_migrations": 1},
 }
 
 # ---------------------------------------------------------------------------
@@ -143,12 +144,13 @@ def _init_schema_legacy() -> None:
                     updated_at   TIMESTAMP DEFAULT NOW()
                 )
             """)
-            for svc in ("oracle_source", "oracle_target", "kafka", "kafka_connect"):
+            for svc in ("oracle_source", "oracle_target", "kafka", "kafka_connect", "runtime"):
+                default_config = {"cdc_parallel_migrations": 1} if svc == "runtime" else {}
                 cur.execute("""
                     INSERT INTO service_configs (service_name, config)
-                    VALUES (%s, '{}'::jsonb)
+                    VALUES (%s, %s::jsonb)
                     ON CONFLICT (service_name) DO NOTHING
-                """, (svc,))
+                """, (svc, json.dumps(default_config)))
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS migrations (
