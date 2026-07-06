@@ -3,6 +3,47 @@ from flask import Flask
 from routes import migrations
 
 
+class DeleteMigrationCursorStub:
+    def __init__(self, calls, *, connector_row=("cdc-main", None, None, None)):
+        self.calls = calls
+        self.connector_row = connector_row
+        self._next_fetchone = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=None):
+        compact_sql = " ".join(sql.split())
+        self.calls.append((compact_sql, params))
+        if "SELECT phase FROM migrations" in compact_sql:
+            self._next_fetchone = ("DRAFT",)
+        elif "SELECT connector_name" in compact_sql:
+            self._next_fetchone = self.connector_row
+        else:
+            self._next_fetchone = None
+
+    def fetchone(self):
+        return self._next_fetchone
+
+
+class DeleteMigrationConnStub:
+    def __init__(self, calls, *, connector_row=("cdc-main", None, None, None)):
+        self.calls = calls
+        self.connector_row = connector_row
+
+    def cursor(self):
+        return DeleteMigrationCursorStub(self.calls, connector_row=self.connector_row)
+
+    def commit(self):
+        self.calls.append(("COMMIT", None))
+
+    def close(self):
+        self.calls.append(("CLOSE", None))
+
+
 class FullRestartCursorStub:
     def __init__(self, calls, *, row=("CDC_APPLYING", "task-1"), rowcounts=None):
         self.calls = calls
@@ -103,6 +144,66 @@ def test_bulk_create_migrations_rejects_direct_cdc_before_db(monkeypatch):
     body = res.get_json()
     assert "Legacy direct CDC migration creation is disabled" in body["error"]
     assert "schema migration screen" in body["error"]
+
+
+def test_delete_group_managed_cdc_migration_keeps_shared_connector(monkeypatch):
+    app = Flask(__name__)
+    app.register_blueprint(migrations.bp)
+    calls = []
+    deleted_connectors = []
+
+    monkeypatch.setitem(migrations._state, "db_available", {"value": True})
+    monkeypatch.setitem(
+        migrations._state,
+        "get_conn",
+        lambda: DeleteMigrationConnStub(
+            calls,
+            connector_row=("cdc-main", None, None, None, "gid-1", "CDC_STAGE"),
+        ),
+    )
+    monkeypatch.setattr(
+        migrations.debezium,
+        "delete_connector",
+        lambda connector_name: deleted_connectors.append(connector_name),
+    )
+
+    res = app.test_client().delete("/api/migrations/mid-1")
+
+    assert res.status_code == 200
+    assert res.get_json() == {"ok": True}
+    assert deleted_connectors == []
+    assert any("DELETE FROM migrations" in sql for sql, _params in calls)
+
+
+def test_cancel_group_managed_cdc_migration_keeps_shared_connector(monkeypatch):
+    app = Flask(__name__)
+    app.register_blueprint(migrations.bp)
+    calls = []
+    broadcasts = []
+    deleted_connectors = []
+
+    monkeypatch.setitem(migrations._state, "db_available", {"value": True})
+    monkeypatch.setitem(
+        migrations._state,
+        "get_conn",
+        lambda: DeleteMigrationConnStub(
+            calls,
+            connector_row=("cdc-main", "gid-1", "CDC_STAGE"),
+        ),
+    )
+    monkeypatch.setitem(migrations._state, "broadcast", lambda event: broadcasts.append(event))
+    monkeypatch.setattr(
+        migrations.debezium,
+        "delete_connector",
+        lambda connector_name: deleted_connectors.append(connector_name),
+    )
+
+    res = app.test_client().post("/api/migrations/mid-1/action", json={"action": "cancel"})
+
+    assert res.status_code == 200
+    assert res.get_json()["to_phase"] == "CANCELLING"
+    assert deleted_connectors == []
+    assert broadcasts[-1]["phase"] == "CANCELLING"
 
 
 def test_full_restart_resets_migration_to_draft(monkeypatch):

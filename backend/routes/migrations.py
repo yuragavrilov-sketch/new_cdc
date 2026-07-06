@@ -685,6 +685,11 @@ def transition_phase(migration_id: str):
 _DELETABLE_PHASES = {"DRAFT", "CANCELLING", "CANCELLED", "FAILED"}
 
 
+def _migration_owns_dedicated_connector(group_id) -> bool:
+    """Rows linked to connector_groups share that group's runtime."""
+    return not group_id
+
+
 @bp.delete("/api/migrations/<migration_id>")
 def delete_migration(migration_id: str):
     if not _db_ok():
@@ -708,7 +713,7 @@ def delete_migration(migration_id: str):
                     }), 409
                 cur.execute(
                     "SELECT connector_name, target_connection_id, "
-                    "       target_schema, stage_table_name "
+                    "       target_schema, stage_table_name, group_id "
                     "FROM   migrations WHERE migration_id = %s",
                     (migration_id,),
                 )
@@ -717,6 +722,7 @@ def delete_migration(migration_id: str):
                 target_conn_id      = crow[1] if crow else None
                 target_schema       = crow[2] if crow else None
                 stage_table_name    = crow[3] if crow else None
+                group_id            = crow[4] if crow and len(crow) > 4 else None
                 cur.execute(
                     "DELETE FROM migration_state_history WHERE migration_id = %s",
                     (migration_id,),
@@ -734,8 +740,9 @@ def delete_migration(migration_id: str):
             conn.commit()
         finally:
             conn.close()
-        # Delete Debezium connector best-effort (after DB commit so row is gone)
-        if connector_name:
+        # Delete legacy per-migration Debezium connector best-effort
+        # (after DB commit so row is gone). CDC packs own shared runtime.
+        if connector_name and _migration_owns_dedicated_connector(group_id):
             try:
                 debezium.delete_connector(connector_name)
             except Exception as exc:
@@ -819,11 +826,12 @@ def migration_action(migration_id: str):
                 try:
                     with conn.cursor() as cur:
                         cur.execute(
-                            "SELECT connector_name FROM migrations WHERE migration_id = %s",
+                            "SELECT connector_name, group_id "
+                            "FROM migrations WHERE migration_id = %s",
                             (migration_id,),
                         )
                         crow = cur.fetchone()
-                    if crow and crow[0]:
+                    if crow and crow[0] and _migration_owns_dedicated_connector(crow[1]):
                         debezium.delete_connector(crow[0])
                 except Exception as exc:
                     print(f"[action/cancel] connector delete failed: {exc}")
