@@ -74,6 +74,43 @@ def test_build_insert_no_lobs_is_empty():
     assert lob == {}
 
 
+def test_source_table_lob_probe_uses_non_reserved_bind_name():
+    class Cursor:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            self.conn.calls.append((" ".join(sql.split()), params))
+
+        def fetchall(self):
+            return [("DOC", "CLOB")]
+
+    class Conn:
+        def __init__(self):
+            self.calls = []
+
+        def cursor(self):
+            return Cursor(self)
+
+    conn = Conn()
+
+    assert worker._source_table_has_lob(conn, "TCBPAY", "FORM#FINGERPRINTS") is True
+
+    sql, params = conn.calls[0]
+    assert "table_name = :table_name" in sql
+    assert ":table " not in f"{sql} "
+    assert params == {
+        "owner": "TCBPAY",
+        "table_name": "FORM#FINGERPRINTS",
+    }
+
+
 def test_bulk_chunk_uses_lob_fetch_batch_for_lob_source_table(monkeypatch):
     class SourceCursor:
         description = [("ID", "NUMT", None, None), ("DOC", "CLOBT", None, None)]

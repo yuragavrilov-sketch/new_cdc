@@ -135,10 +135,10 @@ def _source_table_has_lob(conn, schema: str, table: str) -> bool:
             SELECT column_name, data_type
             FROM   all_tab_columns
             WHERE  owner = :owner
-              AND  table_name = :table
+              AND  table_name = :table_name
               AND  data_type IN ('BLOB', 'CLOB', 'NCLOB')
               AND  ROWNUM = 1
-        """, {"owner": schema.upper(), "table": table.upper()})
+        """, {"owner": schema.upper(), "table_name": table.upper()})
         return bool(cur.fetchall())
 
 
