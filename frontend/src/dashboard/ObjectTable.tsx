@@ -7,6 +7,7 @@ import {
   STATUS_MAP, OBJECT_TYPES,
   type SchemaObject, type ObjectStatus, type ObjectType,
 } from "./types";
+import { columnDiffTitle, hasColumnDiff } from "./tableDdl";
 
 interface Props {
   objects:   SchemaObject[];
@@ -537,6 +538,9 @@ const KEY_LABEL: Record<string, string> = {
 
 function MigrationChips({ o }: { o: SchemaObject }) {
   if (o.type !== "TABLE") return null;
+  const columnChip = hasColumnDiff(o)
+    ? <MiniChip label="COLS Δ" bg={t.tone.warnSoft} fg={t.tone.warn} title={columnDiffTitle(o)}/>
+    : null;
 
   // Чип supplemental logging — рендерим всегда, когда знаем (true/false).
   // Для CDC миграции отсутствие supp-log = красный, для BULK/orphan — просто
@@ -559,8 +563,8 @@ function MigrationChips({ o }: { o: SchemaObject }) {
       : o.hasPk ? <MiniChip label="PK"     bg={`color-mix(in oklab, ${t.tone.ok}   18%, transparent)`} fg={t.tone.ok}/>
       : o.hasUk ? <MiniChip label="UK"     bg={`color-mix(in oklab, ${t.tone.info} 14%, transparent)`} fg={t.tone.info}/>
                 : <MiniChip label="NO KEY" bg={t.tone.errorSoft}                                       fg={t.tone.error}/>;
-    if (!keyChip && !suppChip) return null;
-    return <>{keyChip}{suppChip}</>;
+    if (!keyChip && !suppChip && !columnChip) return null;
+    return <>{keyChip}{suppChip}{columnChip}</>;
   }
 
   const isCdc   = o.strategy.startsWith("CDC_");
@@ -587,13 +591,14 @@ function MigrationChips({ o }: { o: SchemaObject }) {
       />
       {keyTxt && <MiniChip label={keyTxt} bg={keyTone.bg} fg={keyTone.fg}/>}
       {suppChip}
+      {columnChip}
     </>
   );
 }
 
-function MiniChip({ label, bg, fg }: { label: string; bg: string; fg: string }) {
+function MiniChip({ label, bg, fg, title }: { label: string; bg: string; fg: string; title?: string }) {
   return (
-    <span style={{
+    <span title={title} style={{
       display: "inline-block",
       fontFamily: t.font.mono,
       fontSize: "9.5px", fontWeight: 700,

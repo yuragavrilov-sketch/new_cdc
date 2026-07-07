@@ -215,6 +215,41 @@ def _supp_log_from_meta(meta) -> bool | None:
     return None
 
 
+def _zero_column_diff_counts() -> dict[str, int]:
+    return {"missing": 0, "extra": 0, "type": 0, "total": 0}
+
+
+def _diff_item_count(value: Any) -> int:
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    if isinstance(value, int):
+        return max(0, value)
+    return 0
+
+
+def _column_diff_counts(diff_json) -> dict[str, int]:
+    if isinstance(diff_json, str):
+        try:
+            diff_json = json.loads(diff_json)
+        except Exception:
+            diff_json = None
+    if not isinstance(diff_json, dict):
+        return _zero_column_diff_counts()
+    counts = {
+        "missing": _diff_item_count(diff_json.get("cols_missing")),
+        "extra":   _diff_item_count(diff_json.get("cols_extra")),
+        "type":    _diff_item_count(diff_json.get("cols_type")),
+    }
+    counts["total"] = counts["missing"] + counts["extra"] + counts["type"]
+    return counts
+
+
+def _apply_column_diff_flags(obj: dict, diff_json) -> None:
+    counts = _column_diff_counts(diff_json)
+    obj["columnsDiff"] = counts["total"] > 0
+    obj["columnDiffCounts"] = counts
+
+
 def _ddl_id(fe_type: str, object_name: str) -> str:
     """URL-safe id for DDL object — uses frontend alias (e.g. MVIEW, no spaces)."""
     return f"ddl-{fe_type}-{object_name}"
@@ -264,7 +299,7 @@ def _build_ddl_object(
                     note = f"{k.replace('_match', '').replace('_', ' ')} mismatch"
                     break
 
-    return {
+    obj = {
         "id":         _ddl_id(fe_type, object_name),
         "type":       fe_type,
         "name":       object_name,
@@ -284,6 +319,9 @@ def _build_ddl_object(
         "srcStatus":  src_status or "",
         "tgtStatus":  tgt_status or "",
     }
+    if object_type == "TABLE":
+        _apply_column_diff_flags(obj, diff_json)
+    return obj
 
 
 def _build_object(row: dict) -> dict:
@@ -297,7 +335,7 @@ def _build_object(row: dict) -> dict:
         progress = min(100.0, (rows_loaded / total_rows) * 100.0)
     elif status == "done":
         progress = 100.0
-    return {
+    obj = {
         "id":        str(row.get("migration_id")),
         "type":      "TABLE",
         "name":      row.get("source_table") or row.get("migration_name") or "—",
@@ -319,6 +357,8 @@ def _build_object(row: dict) -> dict:
         "hasPk":      bool(row.get("source_pk_exists")),
         "hasUk":      bool(row.get("source_uk_exists")),
     }
+    _apply_column_diff_flags(obj, None)
+    return obj
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -427,8 +467,12 @@ def get_objects(conn, sm_id: str) -> list[dict]:
     if tables:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT o.object_name, o.metadata
+                SELECT o.object_name, o.metadata, c.diff
                 FROM   ddl_objects o
+                LEFT   JOIN ddl_compare_results c
+                       ON c.snapshot_id = o.snapshot_id
+                       AND c.object_type = o.object_type
+                       AND c.object_name = o.object_name
                 WHERE  o.snapshot_id = (
                             SELECT snapshot_id FROM ddl_snapshots
                             WHERE  src_schema = %s AND tgt_schema = %s
@@ -438,10 +482,12 @@ def get_objects(conn, sm_id: str) -> list[dict]:
                   AND  o.object_type = 'TABLE'
                   AND  o.object_name = ANY(%s)
             """, (src_schema, tgt_schema, [t["name"].upper() for t in tables]))
-            meta_by_name = {r[0]: r[1] for r in cur.fetchall()}
+            table_snapshot_by_name = {r[0]: {"metadata": r[1], "diff": r[2]} for r in cur.fetchall()}
         for tbl in tables:
-            meta = meta_by_name.get(tbl["name"].upper())
+            snapshot = table_snapshot_by_name.get(tbl["name"].upper()) or {}
+            meta = snapshot.get("metadata")
             tbl["hasSuppLog"] = _supp_log_from_meta(meta)
+            _apply_column_diff_flags(tbl, snapshot.get("diff"))
 
     # (b) DDL objects from the most recent snapshot
     ddl_objects: list[dict] = []
@@ -460,15 +506,16 @@ def get_objects(conn, sm_id: str) -> list[dict]:
             # synchronising them is pointless. Existing snapshots from before
             # the catalog-side filter still contain them, so we filter again
             # here as a defensive measure.
-            # Skip ddl_compare_results.diff (heavy JSONB blob) in the listing —
-            # it's only ever consumed by /objects/:id/detail. Saves up to MBs
-            # of payload per poll for schemas with thousands of objects.
+            # Skip ddl_compare_results.diff for non-TABLE objects (can be heavy
+            # PL/SQL/SQL JSON). TABLE diff only contains object-name arrays and
+            # is needed for the dashboard column-diff filter.
             cur.execute("""
                 SELECT s.object_type, s.object_name,
                        s.oracle_status        AS src_status,
                        tg.oracle_status       AS tgt_status,
                        COALESCE(c.match_status, 'UNKNOWN') AS match_status,
-                       s.metadata             AS src_meta
+                       s.metadata             AS src_meta,
+                       CASE WHEN s.object_type = 'TABLE' THEN c.diff ELSE NULL END AS diff_json
                 FROM   ddl_objects s
                 LEFT   JOIN ddl_objects tg
                        ON tg.snapshot_id = s.snapshot_id
@@ -490,12 +537,12 @@ def get_objects(conn, sm_id: str) -> list[dict]:
                 ORDER BY s.object_type, s.object_name
             """, (snapshot_id,))
             for r in cur.fetchall():
-                otype, oname, src_status, tgt_status, match_status, src_meta = r
+                otype, oname, src_status, tgt_status, match_status, src_meta, diff_json = r
                 # Skip TABLE rows already represented by a migration
                 if otype == "TABLE" and oname.upper() in migrated_table_names:
                     continue
                 obj = _build_ddl_object(
-                    otype, oname, src_status, tgt_status, match_status, None,
+                    otype, oname, src_status, tgt_status, match_status, diff_json,
                 )
                 # Для TABLE без миграции совпадение DDL не означает перенос
                 # данных — таблица может быть пустой или хранить устаревшие

@@ -2,11 +2,13 @@ import React from "react";
 import { t } from "../theme";
 import { Icon } from "../components/ui";
 import { OBJECT_TYPES, type ObjectType, type SchemaObject } from "./types";
+import { hasColumnDiff } from "./tableDdl";
 
 export type SortKey = "priority" | "size" | "progress" | "name" | "type";
 export type StatusFilter = "all" | "running" | "issues" | "queued" | "done";
 export type KeyFilter = "all" | "pk" | "uk" | "no_key";
 export type SuppFilter = "all" | "supp" | "no_supp";
+export type ColumnDiffFilter = "all" | "diff";
 
 interface Props {
   objects:      SchemaObject[];
@@ -19,6 +21,8 @@ interface Props {
   onKeyFilter:  (v: KeyFilter) => void;
   suppFilter:   SuppFilter;
   onSuppFilter: (v: SuppFilter) => void;
+  columnDiffFilter:   ColumnDiffFilter;
+  onColumnDiffFilter: (v: ColumnDiffFilter) => void;
   search:       string;
   onSearch:     (v: string) => void;
   sort:         SortKey;
@@ -36,7 +40,7 @@ const SORT_LABELS: Record<SortKey, string> = {
 
 export function ObjectFilters({
   objects, filtered, typeFilter, onTypeFilter, statusFilter, onStatusFilter,
-  keyFilter, onKeyFilter, suppFilter, onSuppFilter,
+  keyFilter, onKeyFilter, suppFilter, onSuppFilter, columnDiffFilter, onColumnDiffFilter,
   search, onSearch, sort, onSort,
   tablesOnly = false,
 }: Props) {
@@ -58,6 +62,7 @@ export function ObjectFilters({
   const tables = objects.filter(o => o.type === "TABLE");
   const keyCounts = { all: tables.length, pk: 0, uk: 0, no_key: 0 };
   const suppCounts = { all: tables.length, supp: 0, no_supp: 0 };
+  const columnDiffCounts = { all: tables.length, diff: 0 };
   tables.forEach(o => {
     if (o.hasPk) keyCounts.pk++;
     else if (o.hasUk) keyCounts.uk++;
@@ -65,6 +70,8 @@ export function ObjectFilters({
 
     if (o.hasSuppLog === true) suppCounts.supp++;
     else if (o.hasSuppLog === false) suppCounts.no_supp++;
+
+    if (hasColumnDiff(o)) columnDiffCounts.diff++;
   });
 
   const typePills = (Object.keys(OBJECT_TYPES) as ObjectType[]).filter(k => typeCounts[k] > 0);
@@ -143,6 +150,15 @@ export function ObjectFilters({
               { v: "all",     l: "Все",     c: suppCounts.all     },
               { v: "supp",    l: "SUPP",    c: suppCounts.supp    },
               { v: "no_supp", l: "NO SUPP", c: suppCounts.no_supp },
+            ]}
+          />
+          <span style={{ fontSize: 11, color: t.text.muted, marginLeft: 4 }}>DDL&nbsp;колонок</span>
+          <Segmented
+            value={columnDiffFilter}
+            onChange={onColumnDiffFilter}
+            options={[
+              { v: "all",  l: "Все",          c: columnDiffCounts.all  },
+              { v: "diff", l: "Различаются",  c: columnDiffCounts.diff },
             ]}
           />
         </div>

@@ -85,6 +85,14 @@ export interface SchemaObject {
   /** supplemental_log_data_all (Oracle ALL COLUMNS supp-logging).
    *  undefined — снапшот старый и поле не сохранено; null/false — нет; true — есть. */
   hasSuppLog?: boolean | null;
+  /** DDL diff по колонкам TABLE: missing/extra/type. */
+  columnsDiff?: boolean;
+  columnDiffCounts?: {
+    missing: number;
+    extra: number;
+    type: number;
+    total: number;
+  };
 }
 
 export interface MigrationEvent {

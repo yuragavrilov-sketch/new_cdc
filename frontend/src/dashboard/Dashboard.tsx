@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { ObjectFilters, type SortKey, type StatusFilter, type KeyFilter, type SuppFilter } from "./ObjectFilters";
+import { ObjectFilters, type SortKey, type StatusFilter, type KeyFilter, type SuppFilter, type ColumnDiffFilter } from "./ObjectFilters";
 import { ObjectTable } from "./ObjectTable";
 import { ObjectDrawer } from "./ObjectDrawer";
 import { AddToPackModal } from "./AddToPackModal";
@@ -15,6 +15,7 @@ import { t } from "../theme";
 import { useApi } from "../hooks/useApi";
 import type { SSEEvent } from "../hooks/useSSE";
 import { OBJECT_GROUPS, type ObjectGroupKey, type SchemaObject, type ObjectType, type MigrationEvent } from "./types";
+import { hasColumnDiff } from "./tableDdl";
 import {
   type SchemaMigrationListItem,
   type MigrationPlanDetail,
@@ -228,6 +229,7 @@ export function Dashboard({
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [keyFilter,    setKeyFilter]    = useState<KeyFilter>("all");
   const [suppFilter,   setSuppFilter]   = useState<SuppFilter>("all");
+  const [columnDiffFilter, setColumnDiffFilter] = useState<ColumnDiffFilter>("all");
   const [search,       setSearch]       = useState("");
   const [sort,         setSort]         = useState<SortKey>("priority");
   const [openObject,   setOpenObject]   = useState<SchemaObject | null>(null);
@@ -365,6 +367,9 @@ export function Dashboard({
         return true;
       });
     }
+    if (isTablesGroup && columnDiffFilter !== "all") {
+      arr = arr.filter(hasColumnDiff);
+    }
     if (search) {
       const q = search.toLowerCase();
       arr = arr.filter(o => o.name.toLowerCase().includes(q));
@@ -385,7 +390,7 @@ export function Dashboard({
       return 0;
     });
     return arr;
-  }, [groupObjects, isTablesGroup, typeFilter, statusFilter, keyFilter, suppFilter, search, sort]);
+  }, [groupObjects, isTablesGroup, typeFilter, statusFilter, keyFilter, suppFilter, columnDiffFilter, search, sort]);
   const ddlActiveJobKeys = useMemo(() => {
     const activeStates = new Set(["DRAFT", "PENDING", "CLAIMED", "RUNNING"]);
     const s = new Set<string>();
@@ -419,13 +424,14 @@ export function Dashboard({
   // Reset drawer when switching schemas
   useEffect(() => { setOpenObject(null); }, [selectedId]);
   // Reset to page 1 when filters change so the user always sees the matches
-  useEffect(() => { setPage(1); }, [typeFilter, statusFilter, keyFilter, suppFilter, search, sort, pageSize, selectedId, objectGroup]);
+  useEffect(() => { setPage(1); }, [typeFilter, statusFilter, keyFilter, suppFilter, columnDiffFilter, search, sort, pageSize, selectedId, objectGroup]);
   // Clear bulk-selection when switching schemas
   useEffect(() => { setSelectedIds(new Set()); }, [selectedId]);
   useEffect(() => {
     setTypeFilter("all");
     setKeyFilter("all");
     setSuppFilter("all");
+    setColumnDiffFilter("all");
     setSelectedIds(new Set());
   }, [objectGroup]);
 
@@ -991,6 +997,7 @@ export function Dashboard({
         statusFilter={statusFilter} onStatusFilter={setStatusFilter}
         keyFilter={keyFilter}       onKeyFilter={setKeyFilter}
         suppFilter={suppFilter}     onSuppFilter={setSuppFilter}
+        columnDiffFilter={columnDiffFilter} onColumnDiffFilter={setColumnDiffFilter}
         search={search}             onSearch={setSearch}
         sort={sort}                 onSort={setSort}
         tablesOnly={isTablesGroup}
