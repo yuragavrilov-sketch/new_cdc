@@ -74,6 +74,130 @@ def test_build_insert_no_lobs_is_empty():
     assert lob == {}
 
 
+def test_bulk_chunk_uses_lob_fetch_batch_for_lob_source_table(monkeypatch):
+    class SourceCursor:
+        description = [("ID", "NUMT", None, None), ("DOC", "CLOBT", None, None)]
+
+        def __init__(self, conn):
+            self.conn = conn
+            self.arraysize = None
+            self.prefetchrows = None
+            self.data_query = False
+            self.fetchmany_sizes = []
+            self._rows_fetched = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            compact = " ".join(sql.split())
+            self.conn.executed.append((compact, params))
+            self.data_query = "ROWID BETWEEN" in compact
+
+        def fetchall(self):
+            return [("DOC", "CLOB")]
+
+        def fetchmany(self, size):
+            self.fetchmany_sizes.append(size)
+            if self._rows_fetched:
+                return []
+            self._rows_fetched = True
+            return [(1, "x" * 100)]
+
+    class SourceConn:
+        def __init__(self):
+            self.executed = []
+            self.cursors = []
+            self.closed = False
+
+        def cursor(self):
+            cursor = SourceCursor(self)
+            self.cursors.append(cursor)
+            return cursor
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    class TargetCursor:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def setinputsizes(self, **kwargs):
+            self.conn.inputsizes.append(kwargs)
+
+        def executemany(self, sql, batch):
+            self.conn.batches.append((sql, batch))
+
+    class TargetConn:
+        def __init__(self):
+            self.inputsizes = []
+            self.batches = []
+            self.commits = 0
+            self.closed = False
+
+        def cursor(self):
+            return TargetCursor(self)
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    src_conn = SourceConn()
+    dst_conn = TargetConn()
+    chunk = {
+        "chunk_id": "chunk-1",
+        "migration_id": "mid-1",
+        "source_connection_id": "oracle_source",
+        "target_connection_id": "oracle_target",
+        "source_schema": "SRC",
+        "source_table": "FORM#FINGERPRINTS",
+        "target_schema": "TGT",
+        "target_table": "FORM#FINGERPRINTS",
+        "stage_table": "",
+        "strategy": "CDC_DIRECT",
+        "start_scn": None,
+        "rowid_start": "AAAA",
+        "rowid_end": "BBBB",
+    }
+
+    monkeypatch.setattr(worker, "BULK_BATCH_SIZE", 20_000)
+    monkeypatch.setattr(worker, "BULK_LOB_BATCH_SIZE", 25, raising=False)
+    monkeypatch.setattr(worker, "_LOB_DBTYPES", ("CLOBT",))
+    monkeypatch.setattr(worker.db, "chunk_is_active", lambda *_args: True)
+    monkeypatch.setattr(worker.db, "update_chunk_progress", lambda *_args: None)
+    monkeypatch.setattr(
+        worker.db,
+        "open_oracle",
+        lambda conn_id, *_args: src_conn if conn_id == "oracle_source" else dst_conn,
+    )
+
+    rows_loaded = worker._process_bulk_chunk(chunk, "pg-conn", {})
+
+    data_cursor = next(cursor for cursor in src_conn.cursors if cursor.data_query)
+    assert rows_loaded == 1
+    assert data_cursor.arraysize == 25
+    assert data_cursor.prefetchrows == 25
+    assert data_cursor.fetchmany_sizes == [25, 25]
+    assert dst_conn.commits == 1
+
+
 # ---------------------------------------------------------------------------
 # LOBs are now compared by length (worker and route must agree)
 # ---------------------------------------------------------------------------

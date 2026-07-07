@@ -11,6 +11,7 @@ Environment variables (see .env.example):
     STATE_DB_DSN       PostgreSQL DSN           (default: postgres://postgres:postgres@localhost:5432/migration_state)
     WORKER_ID          Unique identifier        (default: hostname:pid)
     BULK_BATCH_SIZE    Rows per INSERT batch    (default: 5000)
+    BULK_LOB_BATCH_SIZE Rows per INSERT batch for tables with LOB columns (default: 100)
     BULK_POLL_INTERVAL Seconds between polls    (default: 5)
     CDC_BATCH_SIZE     Kafka records per cycle  (default: 500)
     CDC_CHECKIN_SEC    Seconds between checkins (default: 30)
@@ -70,6 +71,7 @@ except ImportError:
     pass
 
 BULK_BATCH_SIZE    = int(os.environ.get("BULK_BATCH_SIZE",    20_000))
+BULK_LOB_BATCH_SIZE = max(1, int(os.environ.get("BULK_LOB_BATCH_SIZE", 100)))
 BULK_POLL_INTERVAL = int(os.environ.get("BULK_POLL_INTERVAL", 5))
 CDC_BATCH_SIZE     = int(os.environ.get("CDC_BATCH_SIZE",     500))
 CDC_CHECKIN_SEC    = int(os.environ.get("CDC_CHECKIN_SEC",    30))
@@ -125,6 +127,20 @@ def _ensure_chunk_active(pg_conn, chunk_id: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # BULK LOADING
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _source_table_has_lob(conn, schema: str, table: str) -> bool:
+    """Return True when source table contains LOB columns."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name, data_type
+            FROM   all_tab_columns
+            WHERE  owner = :owner
+              AND  table_name = :table
+              AND  data_type IN ('BLOB', 'CLOB', 'NCLOB')
+              AND  ROWNUM = 1
+        """, {"owner": schema.upper(), "table": table.upper()})
+        return bool(cur.fetchall())
+
 
 def _build_insert(cursor_description, target_schema: str,
                   stage_table: str) -> tuple:
@@ -205,10 +221,20 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
     )
     rows_loaded = 0
     try:
+        _ensure_chunk_active(pg_conn, chunk_id)
+        source_has_lob = _source_table_has_lob(src_conn, src_schema, src_table)
+        fetch_batch_size = (
+            min(BULK_BATCH_SIZE, BULK_LOB_BATCH_SIZE)
+            if source_has_lob else BULK_BATCH_SIZE
+        )
+        if source_has_lob:
+            print(
+                f"[worker] chunk {chunk_id}: source has LOB columns; "
+                f"bulk batch capped at {fetch_batch_size}"
+            )
         with src_conn.cursor() as cur:
-            cur.arraysize = BULK_BATCH_SIZE
-            cur.prefetchrows = BULK_BATCH_SIZE + 1
-            _ensure_chunk_active(pg_conn, chunk_id)
+            cur.arraysize = fetch_batch_size
+            cur.prefetchrows = fetch_batch_size if source_has_lob else fetch_batch_size + 1
             if start_scn:
                 # Consistent snapshot via flashback query
                 cur.execute(
@@ -228,7 +254,7 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
                 cur.description, tgt_schema, dest_table)
             while True:
                 _ensure_chunk_active(pg_conn, chunk_id)
-                rows = cur.fetchmany(BULK_BATCH_SIZE)
+                rows = cur.fetchmany(fetch_batch_size)
                 if not rows:
                     break
                 _ensure_chunk_active(pg_conn, chunk_id)
