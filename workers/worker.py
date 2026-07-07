@@ -60,6 +60,7 @@ from common import WORKER_ID
 # from AS OF SCN flashback cursors are invalid outside the fetching cursor,
 # which causes ORA-64219.  Setting this globally is safe for bulk copy.
 _LOB_DBTYPES: tuple = ()
+_LOB_BIND_DBTYPE_BY_DATA_TYPE: dict = {}
 try:
     import oracledb
     oracledb.defaults.fetch_lobs = False
@@ -67,6 +68,11 @@ try:
     # of letting oracledb preallocate a full per-batch char/byte buffer, which
     # would OOM on multi-MB LOBs at BULK_BATCH_SIZE rows.
     _LOB_DBTYPES = (oracledb.DB_TYPE_CLOB, oracledb.DB_TYPE_NCLOB, oracledb.DB_TYPE_BLOB)
+    _LOB_BIND_DBTYPE_BY_DATA_TYPE = {
+        "CLOB": oracledb.DB_TYPE_CLOB,
+        "NCLOB": oracledb.DB_TYPE_NCLOB,
+        "BLOB": oracledb.DB_TYPE_BLOB,
+    }
 except ImportError:
     pass
 
@@ -128,8 +134,8 @@ def _ensure_chunk_active(pg_conn, chunk_id: str) -> None:
 # BULK LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _source_table_has_lob(conn, schema: str, table: str) -> bool:
-    """Return True when source table contains LOB columns."""
+def _source_lob_column_types(conn, schema: str, table: str) -> dict:
+    """Return source LOB column names mapped to Oracle dictionary data types."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT column_name, data_type
@@ -137,13 +143,20 @@ def _source_table_has_lob(conn, schema: str, table: str) -> bool:
             WHERE  owner = :owner
               AND  table_name = :table_name
               AND  data_type IN ('BLOB', 'CLOB', 'NCLOB')
-              AND  ROWNUM = 1
         """, {"owner": schema.upper(), "table_name": table.upper()})
-        return bool(cur.fetchall())
+        return {
+            str(column_name).upper(): str(data_type).upper()
+            for column_name, data_type in cur.fetchall()
+        }
+
+
+def _source_table_has_lob(conn, schema: str, table: str) -> bool:
+    """Return True when source table contains LOB columns."""
+    return bool(_source_lob_column_types(conn, schema, table))
 
 
 def _build_insert(cursor_description, target_schema: str,
-                  stage_table: str) -> tuple:
+                  stage_table: str, source_lob_column_types: dict | None = None) -> tuple:
     """
     Returns (sql, bind_names).
 
@@ -162,11 +175,21 @@ def _build_insert(cursor_description, target_schema: str,
     )
     # Bind LOB columns explicitly as LOBs so oracledb streams them instead of
     # sizing a full per-batch buffer from the data (OOM risk on large LOBs).
-    lob_inputsizes = {
-        bind_names[i]: d[1]
-        for i, d in enumerate(cursor_description)
-        if _LOB_DBTYPES and d[1] in _LOB_DBTYPES
+    # With fetch_lobs=False, CLOB/NCLOB may appear in cursor.description as
+    # DB_TYPE_LONG, so prefer all_tab_columns metadata when it is available.
+    source_lob_column_types = {
+        str(name).upper(): str(data_type).upper()
+        for name, data_type in (source_lob_column_types or {}).items()
     }
+    lob_inputsizes = {}
+    for i, d in enumerate(cursor_description):
+        bind_name = bind_names[i]
+        source_lob_type = source_lob_column_types.get(str(d[0]).upper())
+        metadata_dbtype = _LOB_BIND_DBTYPE_BY_DATA_TYPE.get(source_lob_type)
+        if metadata_dbtype is not None:
+            lob_inputsizes[bind_name] = metadata_dbtype
+        elif _LOB_DBTYPES and d[1] in _LOB_DBTYPES:
+            lob_inputsizes[bind_name] = d[1]
     return sql, bind_names, lob_inputsizes
 
 
@@ -285,6 +308,7 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
     last_lob_summary = "none"
     lob_bind_columns: dict = {}
     lob_inputsizes: dict = {}
+    source_lob_column_types: dict = {}
 
     src_conn = db.open_oracle(
         chunk["source_connection_id"],
@@ -317,15 +341,21 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
         stage = "chunk-active"
         _ensure_chunk_active(pg_conn, chunk_id)
         stage = "lob-probe"
-        source_has_lob = _source_table_has_lob(src_conn, src_schema, src_table)
+        source_lob_column_types = _source_lob_column_types(src_conn, src_schema, src_table)
+        source_has_lob = bool(source_lob_column_types)
         fetch_batch_size = (
             min(BULK_BATCH_SIZE, BULK_LOB_BATCH_SIZE)
             if source_has_lob else BULK_BATCH_SIZE
         )
         if source_has_lob:
+            lob_columns_text = ",".join(
+                f"{name}:{data_type}"
+                for name, data_type in sorted(source_lob_column_types.items())
+            )
             print(
                 f"[worker] chunk {chunk_id}: source has LOB columns; "
-                f"bulk batch capped at {fetch_batch_size}"
+                f"bulk batch capped at {fetch_batch_size}; "
+                f"lob_columns={lob_columns_text}"
             )
         with src_conn.cursor() as cur:
             cur.arraysize = fetch_batch_size
@@ -354,7 +384,7 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
                 )
             stage = "build-insert"
             insert_sql, bind_names, lob_inputsizes = _build_insert(
-                cur.description, tgt_schema, dest_table)
+                cur.description, tgt_schema, dest_table, source_lob_column_types)
             lob_bind_columns = {
                 bind_names[i]: col[0]
                 for i, col in enumerate(cur.description or [])

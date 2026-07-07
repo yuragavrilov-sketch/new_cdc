@@ -61,6 +61,31 @@ def test_build_insert_marks_lob_binds(monkeypatch):
     assert "APPEND_VALUES" in sql
 
 
+def test_build_insert_uses_source_lob_metadata_when_fetch_reports_long(monkeypatch):
+    monkeypatch.setattr(
+        worker,
+        "_LOB_BIND_DBTYPE_BY_DATA_TYPE",
+        {"CLOB": "CLOBT", "NCLOB": "NCLOBT", "BLOB": "BLOBT"},
+    )
+    desc = [
+        ("ORDERID", "NUMT", None, None),
+        ("GOOGLEDATA", "LONGT", None, None),
+        ("FINGERPRINTDATA", "LONGT", None, None),
+    ]
+
+    sql, binds, lob = worker._build_insert(
+        desc,
+        "TCBPAY",
+        "FORM#FINGERPRINTS",
+        {"GOOGLEDATA": "CLOB", "FINGERPRINTDATA": "CLOB"},
+    )
+
+    assert binds == ["c0", "c1", "c2"]
+    assert lob == {"c1": "CLOBT", "c2": "CLOBT"}
+    assert '"GOOGLEDATA"' in sql
+    assert '"FINGERPRINTDATA"' in sql
+
+
 def test_build_insert_no_lobs_is_empty():
     monkeypatch_free_desc = [("ID", "NUMT", None, None)]
     # _LOB_DBTYPES is () when oracledb is absent; force that for determinism.
@@ -135,7 +160,7 @@ def test_bulk_lob_batch_summary_reports_types_and_lengths_without_values():
 
 def test_bulk_chunk_uses_lob_fetch_batch_for_lob_source_table(monkeypatch):
     class SourceCursor:
-        description = [("ID", "NUMT", None, None), ("DOC", "CLOBT", None, None)]
+        description = [("ID", "NUMT", None, None), ("DOC", "LONGT", None, None)]
 
         def __init__(self, conn):
             self.conn = conn
@@ -238,7 +263,8 @@ def test_bulk_chunk_uses_lob_fetch_batch_for_lob_source_table(monkeypatch):
 
     monkeypatch.setattr(worker, "BULK_BATCH_SIZE", 20_000)
     monkeypatch.setattr(worker, "BULK_LOB_BATCH_SIZE", 25, raising=False)
-    monkeypatch.setattr(worker, "_LOB_DBTYPES", ("CLOBT",))
+    monkeypatch.setattr(worker, "_LOB_DBTYPES", ())
+    monkeypatch.setattr(worker, "_LOB_BIND_DBTYPE_BY_DATA_TYPE", {"CLOB": "CLOBT"})
     monkeypatch.setattr(worker.db, "chunk_is_active", lambda *_args: True)
     monkeypatch.setattr(worker.db, "update_chunk_progress", lambda *_args: None)
     monkeypatch.setattr(
@@ -254,6 +280,7 @@ def test_bulk_chunk_uses_lob_fetch_batch_for_lob_source_table(monkeypatch):
     assert data_cursor.arraysize == 25
     assert data_cursor.prefetchrows == 25
     assert data_cursor.fetchmany_sizes == [25, 25]
+    assert dst_conn.inputsizes == [{"c1": "CLOBT"}]
     assert dst_conn.commits == 1
 
 
