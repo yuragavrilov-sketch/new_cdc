@@ -48,6 +48,10 @@ def test_sanitize_passes_clob_text_through():
 # Bulk insert binds LOB columns as LOBs
 # ---------------------------------------------------------------------------
 
+def test_lob_batch_size_defaults_to_bulk_batch_size():
+    assert worker.BULK_LOB_BATCH_SIZE == worker.BULK_BATCH_SIZE
+
+
 def test_build_insert_marks_lob_binds(monkeypatch):
     monkeypatch.setattr(worker, "_LOB_DBTYPES", ("CLOBT", "BLOBT"))
     desc = [
@@ -262,7 +266,7 @@ def test_bulk_chunk_uses_lob_fetch_batch_for_lob_source_table(monkeypatch):
     }
 
     monkeypatch.setattr(worker, "BULK_BATCH_SIZE", 20_000)
-    monkeypatch.setattr(worker, "BULK_LOB_BATCH_SIZE", 25, raising=False)
+    monkeypatch.setattr(worker, "BULK_LOB_BATCH_SIZE", 20_000, raising=False)
     monkeypatch.setattr(worker, "_LOB_DBTYPES", ())
     monkeypatch.setattr(worker, "_LOB_BIND_DBTYPE_BY_DATA_TYPE", {"CLOB": "CLOBT"})
     monkeypatch.setattr(worker.db, "chunk_is_active", lambda *_args: True)
@@ -277,9 +281,9 @@ def test_bulk_chunk_uses_lob_fetch_batch_for_lob_source_table(monkeypatch):
 
     data_cursor = next(cursor for cursor in src_conn.cursors if cursor.data_query)
     assert rows_loaded == 1
-    assert data_cursor.arraysize == 25
-    assert data_cursor.prefetchrows == 25
-    assert data_cursor.fetchmany_sizes == [25, 25]
+    assert data_cursor.arraysize == 20_000
+    assert data_cursor.prefetchrows == 20_000
+    assert data_cursor.fetchmany_sizes == [20_000, 20_000]
     assert dst_conn.inputsizes == [{"c1": "CLOBT"}]
     assert dst_conn.commits == 1
 

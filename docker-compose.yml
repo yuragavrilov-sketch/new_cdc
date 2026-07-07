@@ -62,7 +62,6 @@ services:
     environment:
       STATE_DB_DSN:       postgresql://postgres:postgres@postgres:5432/migration_state
       BULK_BATCH_SIZE:    "20000"   # rows per fetch/insert batch; lower if workers OOM on wide rows
-      BULK_LOB_BATCH_SIZE: "100"     # safer cap for tables with BLOB/CLOB/NCLOB columns
       BULK_POLL_INTERVAL: "5"
       CDC_BATCH_SIZE:     "500"
       CDC_CHECKIN_SEC:    "30"

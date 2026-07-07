@@ -20,7 +20,6 @@ COPY workers/ ./
 # Default environment (override via docker-compose / -e flags)
 ENV STATE_DB_DSN=postgresql://postgres:postgres@postgres:5432/migration_state \
     BULK_BATCH_SIZE=5000 \
-    BULK_LOB_BATCH_SIZE=100 \
     BULK_POLL_INTERVAL=5 \
     CDC_BATCH_SIZE=500 \
     CDC_CHECKIN_SEC=30 \

@@ -11,7 +11,7 @@ Environment variables (see .env.example):
     STATE_DB_DSN       PostgreSQL DSN           (default: postgres://postgres:postgres@localhost:5432/migration_state)
     WORKER_ID          Unique identifier        (default: hostname:pid)
     BULK_BATCH_SIZE    Rows per INSERT batch    (default: 5000)
-    BULK_LOB_BATCH_SIZE Rows per INSERT batch for tables with LOB columns (default: 100)
+    BULK_LOB_BATCH_SIZE Optional rows per INSERT batch cap for LOB tables (default: BULK_BATCH_SIZE)
     BULK_POLL_INTERVAL Seconds between polls    (default: 5)
     CDC_BATCH_SIZE     Kafka records per cycle  (default: 500)
     CDC_CHECKIN_SEC    Seconds between checkins (default: 30)
@@ -77,7 +77,7 @@ except ImportError:
     pass
 
 BULK_BATCH_SIZE    = int(os.environ.get("BULK_BATCH_SIZE",    20_000))
-BULK_LOB_BATCH_SIZE = max(1, int(os.environ.get("BULK_LOB_BATCH_SIZE", 100)))
+BULK_LOB_BATCH_SIZE = max(1, int(os.environ.get("BULK_LOB_BATCH_SIZE", BULK_BATCH_SIZE)))
 BULK_POLL_INTERVAL = int(os.environ.get("BULK_POLL_INTERVAL", 5))
 CDC_BATCH_SIZE     = int(os.environ.get("CDC_BATCH_SIZE",     500))
 CDC_CHECKIN_SEC    = int(os.environ.get("CDC_CHECKIN_SEC",    30))
@@ -352,10 +352,14 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
                 f"{name}:{data_type}"
                 for name, data_type in sorted(source_lob_column_types.items())
             )
+            batch_note = (
+                f"bulk batch capped at {fetch_batch_size}"
+                if fetch_batch_size < BULK_BATCH_SIZE
+                else f"bulk batch={fetch_batch_size}"
+            )
             print(
                 f"[worker] chunk {chunk_id}: source has LOB columns; "
-                f"bulk batch capped at {fetch_batch_size}; "
-                f"lob_columns={lob_columns_text}"
+                f"{batch_note}; lob_columns={lob_columns_text}"
             )
         with src_conn.cursor() as cur:
             cur.arraysize = fetch_batch_size
