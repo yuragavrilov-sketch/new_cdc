@@ -111,6 +111,28 @@ def test_source_table_lob_probe_uses_non_reserved_bind_name():
     }
 
 
+def test_bulk_lob_batch_summary_reports_types_and_lengths_without_values():
+    batch = [
+        {"c0": 1, "c1": "secret-clob-data"},
+        {"c0": 2, "c1": None},
+        {"c0": 3, "c1": b"\x00\x01"},
+    ]
+
+    summary = worker._bulk_lob_batch_summary(
+        batch,
+        {"c1": "DOC"},
+        {"c1": "CLOBT"},
+    )
+
+    assert "c1/DOC" in summary
+    assert "dbtype=CLOBT" in summary
+    assert "py_types=NoneType:1,bytes:1,str:1" in summary
+    assert "nulls=1/3" in summary
+    assert "max_len=16" in summary
+    assert "total_len=18" in summary
+    assert "secret-clob-data" not in summary
+
+
 def test_bulk_chunk_uses_lob_fetch_batch_for_lob_source_table(monkeypatch):
     class SourceCursor:
         description = [("ID", "NUMT", None, None), ("DOC", "CLOBT", None, None)]
@@ -233,6 +255,124 @@ def test_bulk_chunk_uses_lob_fetch_batch_for_lob_source_table(monkeypatch):
     assert data_cursor.prefetchrows == 25
     assert data_cursor.fetchmany_sizes == [25, 25]
     assert dst_conn.commits == 1
+
+
+def test_bulk_chunk_logs_flush_context_on_oracle_protocol_error(monkeypatch, capsys):
+    class SourceCursor:
+        description = [("ID", "NUMT", None, None), ("DOC", "CLOBT", None, None)]
+
+        def __init__(self, conn):
+            self.conn = conn
+            self.arraysize = None
+            self.prefetchrows = None
+            self.data_query = False
+            self._rows_fetched = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            compact = " ".join(sql.split())
+            self.conn.executed.append((compact, params))
+            self.data_query = "ROWID BETWEEN" in compact
+
+        def fetchall(self):
+            return [("DOC", "CLOB")]
+
+        def fetchmany(self, _size):
+            if self._rows_fetched:
+                return []
+            self._rows_fetched = True
+            return [(1, "secret-clob-data")]
+
+    class SourceConn:
+        def __init__(self):
+            self.executed = []
+
+        def cursor(self):
+            return SourceCursor(self)
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    class TargetCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def setinputsizes(self, **_kwargs):
+            pass
+
+        def executemany(self, _sql, _batch):
+            raise RuntimeError("ORA-03106: fatal two-task communication protocol error")
+
+    class TargetConn:
+        def cursor(self):
+            return TargetCursor()
+
+        def commit(self):
+            raise AssertionError("commit must not run after failed executemany")
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    src_conn = SourceConn()
+    dst_conn = TargetConn()
+    chunk = {
+        "chunk_id": "chunk-ora-03106",
+        "chunk_seq": 42,
+        "migration_id": "migration-1",
+        "source_connection_id": "oracle_source",
+        "target_connection_id": "oracle_target",
+        "source_schema": "TCBPAY",
+        "source_table": "FORM#FINGERPRINTS",
+        "target_schema": "TCBPAY",
+        "target_table": "FORM#FINGERPRINTS",
+        "stage_table": "",
+        "strategy": "CDC_DIRECT",
+        "start_scn": None,
+        "rowid_start": "AAAA",
+        "rowid_end": "BBBB",
+    }
+
+    monkeypatch.setattr(worker, "BULK_BATCH_SIZE", 20_000)
+    monkeypatch.setattr(worker, "BULK_LOB_BATCH_SIZE", 25, raising=False)
+    monkeypatch.setattr(worker, "_LOB_DBTYPES", ("CLOBT",))
+    monkeypatch.setattr(worker.db, "chunk_is_active", lambda *_args: True)
+    monkeypatch.setattr(
+        worker.db,
+        "open_oracle",
+        lambda conn_id, *_args: src_conn if conn_id == "oracle_source" else dst_conn,
+    )
+
+    try:
+        worker._process_bulk_chunk(chunk, "pg-conn", {})
+    except RuntimeError as exc:
+        assert "ORA-03106" in str(exc)
+    else:
+        raise AssertionError("expected ORA-03106 failure")
+
+    out = capsys.readouterr().out
+    assert "[bulk:chunk-or] FAILED stage=flush batch=1" in out
+    assert "src=TCBPAY.FORM#FINGERPRINTS" in out
+    assert "dest=TCBPAY.FORM#FINGERPRINTS" in out
+    assert "rows_loaded=0" in out
+    assert "batch_rows=1" in out
+    assert "lob_summary=c1/DOC" in out
+    assert "py_types=str:1" in out
+    assert "max_len=16" in out
+    assert "secret-clob-data" not in out
 
 
 # ---------------------------------------------------------------------------

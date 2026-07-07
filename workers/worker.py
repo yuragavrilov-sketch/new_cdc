@@ -170,6 +170,81 @@ def _build_insert(cursor_description, target_schema: str,
     return sql, bind_names, lob_inputsizes
 
 
+def _compact_sql(sql: str, limit: int = 1200) -> str:
+    compact = " ".join(str(sql).split())
+    return compact if len(compact) <= limit else compact[:limit - 3] + "..."
+
+
+def _dbtype_name(dbtype) -> str:
+    return getattr(dbtype, "name", None) or str(dbtype)
+
+
+def _safe_value_len(value) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, bytearray, memoryview)):
+        return len(value)
+    size = getattr(value, "size", None)
+    if callable(size):
+        try:
+            return int(size())
+        except Exception:
+            return None
+    return None
+
+
+def _bulk_lob_batch_summary(batch: list, lob_bind_columns: dict,
+                            lob_inputsizes: dict | None) -> str:
+    """Summarise LOB bind values without logging actual column data."""
+    if not lob_inputsizes:
+        return "none"
+    parts = []
+    for bind_name in sorted(lob_inputsizes):
+        type_counts: dict[str, int] = {}
+        nulls = 0
+        measured = 0
+        unknown_len = 0
+        max_len = None
+        total_len = 0
+        for row in batch:
+            value = row.get(bind_name)
+            type_name = type(value).__name__
+            type_counts[type_name] = type_counts.get(type_name, 0) + 1
+            if value is None:
+                nulls += 1
+                continue
+            value_len = _safe_value_len(value)
+            if value_len is None:
+                unknown_len += 1
+                continue
+            measured += 1
+            total_len += value_len
+            max_len = value_len if max_len is None else max(max_len, value_len)
+        type_summary = ",".join(
+            f"{name}:{count}" for name, count in sorted(type_counts.items())
+        ) or "none"
+        max_text = str(max_len) if max_len is not None else "n/a"
+        total_text = str(total_len) if measured else "n/a"
+        unknown_text = f" unknown_len={unknown_len}" if unknown_len else ""
+        parts.append(
+            f"{bind_name}/{lob_bind_columns.get(bind_name, '?')} "
+            f"dbtype={_dbtype_name(lob_inputsizes[bind_name])} "
+            f"py_types={type_summary} nulls={nulls}/{len(batch)} "
+            f"max_len={max_text} total_len={total_text}{unknown_text}"
+        )
+    return "; ".join(parts)
+
+
+def _cursor_description_summary(description, limit: int = 2000) -> str:
+    parts = []
+    for col in description or []:
+        name = col[0] if len(col) > 0 else "?"
+        dbtype = _dbtype_name(col[1]) if len(col) > 1 else "?"
+        parts.append(f"{name}:{dbtype}")
+    text = ", ".join(parts)
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
 def _flush_batch(dst_conn, insert_sql: str, batch: list,
                  lob_inputsizes: dict | None = None) -> None:
     """Execute one batch insert and commit."""
@@ -198,6 +273,18 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
     rowid_start = chunk["rowid_start"]
     rowid_end   = chunk["rowid_end"]
     migration_id = str(chunk.get("migration_id") or "")
+    tag = chunk_id[:8]
+    src_label = f"{src_schema}.{src_table}"
+    dest_label = f"{tgt_schema}.{dest_table}"
+    source_has_lob = False
+    fetch_batch_size = BULK_BATCH_SIZE
+    stage = "start"
+    batch_no = 0
+    batch_rows = 0
+    insert_sql = ""
+    last_lob_summary = "none"
+    lob_bind_columns: dict = {}
+    lob_inputsizes: dict = {}
 
     src_conn = db.open_oracle(
         chunk["source_connection_id"],
@@ -221,7 +308,15 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
     )
     rows_loaded = 0
     try:
+        print(
+            f"[bulk:{tag}] start seq={chunk.get('chunk_seq')} strategy={strategy} "
+            f"src={src_label} dest={dest_label} uses_stage={uses_stage} "
+            f"start_scn={start_scn or 'current'} rowid={rowid_start}..{rowid_end} "
+            f"bulk_batch={BULK_BATCH_SIZE} lob_batch={BULK_LOB_BATCH_SIZE}"
+        )
+        stage = "chunk-active"
         _ensure_chunk_active(pg_conn, chunk_id)
+        stage = "lob-probe"
         source_has_lob = _source_table_has_lob(src_conn, src_schema, src_table)
         fetch_batch_size = (
             min(BULK_BATCH_SIZE, BULK_LOB_BATCH_SIZE)
@@ -235,8 +330,14 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
         with src_conn.cursor() as cur:
             cur.arraysize = fetch_batch_size
             cur.prefetchrows = fetch_batch_size if source_has_lob else fetch_batch_size + 1
+            print(
+                f"[bulk:{tag}] source_query mode="
+                f"{'flashback' if start_scn else 'current'} "
+                f"arraysize={cur.arraysize} prefetchrows={cur.prefetchrows}"
+            )
             if start_scn:
                 # Consistent snapshot via flashback query
+                stage = "source-query flashback"
                 cur.execute(
                     f'SELECT * FROM "{src_schema.upper()}"."{src_table.upper()}" '
                     f'AS OF SCN :p_scn '
@@ -245,20 +346,48 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
                 )
             else:
                 # Read current data without flashback.
+                stage = "source-query current"
                 cur.execute(
                     f'SELECT * FROM "{src_schema.upper()}"."{src_table.upper()}" '
                     f'WHERE ROWID BETWEEN CHARTOROWID(:p_start) AND CHARTOROWID(:p_end)',
                     {"p_start": rowid_start, "p_end": rowid_end},
                 )
+            stage = "build-insert"
             insert_sql, bind_names, lob_inputsizes = _build_insert(
                 cur.description, tgt_schema, dest_table)
+            lob_bind_columns = {
+                bind_names[i]: col[0]
+                for i, col in enumerate(cur.description or [])
+                if bind_names[i] in lob_inputsizes
+            }
+            print(
+                f"[bulk:{tag}] source_describe columns={len(cur.description or [])} "
+                f"desc={_cursor_description_summary(cur.description)}"
+            )
+            print(
+                f"[bulk:{tag}] target_insert bind_count={len(bind_names)} "
+                f"lob_binds={','.join(sorted(lob_inputsizes)) or 'none'} "
+                f"sql={_compact_sql(insert_sql)}"
+            )
             while True:
+                stage = f"fetch batch={batch_no + 1}"
                 _ensure_chunk_active(pg_conn, chunk_id)
                 rows = cur.fetchmany(fetch_batch_size)
                 if not rows:
                     break
                 _ensure_chunk_active(pg_conn, chunk_id)
+                batch_no += 1
+                batch_rows = len(rows)
                 batch = [dict(zip(bind_names, row)) for row in rows]
+                last_lob_summary = _bulk_lob_batch_summary(
+                    batch, lob_bind_columns, lob_inputsizes
+                )
+                if lob_inputsizes:
+                    print(
+                        f"[bulk:{tag}] flush batch={batch_no} rows={batch_rows} "
+                        f"rows_loaded={rows_loaded} lob_summary={last_lob_summary}"
+                    )
+                stage = f"flush batch={batch_no}"
                 _flush_batch(dst_conn, insert_sql, batch, lob_inputsizes)
                 rows_loaded += len(batch)
                 db.update_chunk_progress(pg_conn, chunk_id, rows_loaded)
@@ -267,6 +396,18 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
         for c in (src_conn, dst_conn):
             try: c.rollback()
             except Exception: pass
+        raise
+    except Exception as exc:
+        print(
+            f"[bulk:{tag}] FAILED stage={stage} err={type(exc).__name__}: {exc} "
+            f"src={src_label} dest={dest_label} strategy={strategy} "
+            f"rows_loaded={rows_loaded} batch={batch_no} batch_rows={batch_rows} "
+            f"source_has_lob={source_has_lob} fetch_batch={fetch_batch_size} "
+            f"start_scn={start_scn or 'current'} rowid={rowid_start}..{rowid_end} "
+            f"lob_summary={last_lob_summary}"
+        )
+        if insert_sql:
+            print(f"[bulk:{tag}] failed_insert_sql={_compact_sql(insert_sql)}")
         raise
     finally:
         for c in (src_conn, dst_conn):
