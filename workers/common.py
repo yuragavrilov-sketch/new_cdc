@@ -89,7 +89,33 @@ def load_configs(conn) -> dict:
 # Oracle connection
 # ---------------------------------------------------------------------------
 
-def open_oracle(connection_id: str, configs: dict):
+_ORACLE_CONTEXT_LIMITS = {
+    "module": 48,
+    "action": 32,
+    "client_identifier": 64,
+}
+
+
+def _truncate_context_value(key: str, value: object) -> str:
+    limit = _ORACLE_CONTEXT_LIMITS[key]
+    return str(value or "")[:limit]
+
+
+def apply_oracle_session_context(conn, context: Optional[dict]) -> None:
+    """Set Oracle end-to-end tracing fields visible in v$session."""
+    if not context:
+        return
+    for key in ("module", "action", "client_identifier"):
+        value = context.get(key)
+        if not value:
+            continue
+        try:
+            setattr(conn, key, _truncate_context_value(key, value))
+        except Exception:
+            pass
+
+
+def open_oracle(connection_id: str, configs: dict, session_context: Optional[dict] = None):
     """
     Open an Oracle connection using the service config keyed by connection_id.
     connection_id = 'oracle_source' | 'oracle_target'
@@ -124,6 +150,7 @@ def open_oracle(connection_id: str, configs: dict):
             return cursor.var(oracledb.DB_TYPE_TIMESTAMP, arraysize=arraysize)
 
     conn.inputtypehandler = _input_type_handler
+    apply_oracle_session_context(conn, session_context)
     return conn
 
 
@@ -272,6 +299,38 @@ def complete_chunk(conn, chunk_id: str, rows_loaded: int) -> None:
                            updated_at   = NOW()
                     WHERE  migration_id = %s
                 """, (rows_loaded, migration_id))
+    conn.commit()
+
+
+def chunk_is_active(conn, chunk_id: str) -> bool:
+    """Return False when a claimed/running chunk should stop before more Oracle work."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT c.status, m.phase
+            FROM   migration_chunks c
+            JOIN   migrations m ON m.migration_id = c.migration_id
+            WHERE  c.chunk_id = %s
+        """, (chunk_id,))
+        row = cur.fetchone()
+    if not row:
+        return False
+    status, phase = row
+    return (
+        status in ("CLAIMED", "RUNNING")
+        and phase not in ("CANCELLING", "CANCELLED", "FAILED", "COMPLETED")
+    )
+
+
+def cancel_chunk(conn, chunk_id: str, reason: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE migration_chunks
+            SET    status       = 'CANCELLED',
+                   error_text   = %s,
+                   completed_at = NOW()
+            WHERE  chunk_id     = %s
+              AND  status IN ('PENDING', 'CLAIMED', 'RUNNING')
+        """, (reason[:2000], chunk_id))
     conn.commit()
 
 

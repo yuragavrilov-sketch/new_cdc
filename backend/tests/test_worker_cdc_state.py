@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 
@@ -85,6 +86,63 @@ def test_cdc_topic_name_sanitizes_hash_table_names():
         worker_common.cdc_topic_name("sm.tcbpay.pay.r123ab", "tcbpay", "merchants#orders")
         == "sm.tcbpay.pay.r123ab.TCBPAY.MERCHANTS_ORDERS"
     )
+
+
+def test_open_oracle_applies_session_context(monkeypatch):
+    class OracleConnStub:
+        module = ""
+        action = ""
+        client_identifier = ""
+
+    conn = OracleConnStub()
+    fake_oracledb = types.SimpleNamespace(
+        DB_TYPE_TIMESTAMP=object(),
+        connect=lambda **_kwargs: conn,
+    )
+    monkeypatch.setitem(sys.modules, "oracledb", fake_oracledb)
+
+    result = worker_common.open_oracle(
+        "oracle_target",
+        {
+            "oracle_target": {
+                "host": "db-host",
+                "port": 1521,
+                "service_name": "svc",
+                "user": "usr",
+                "password": "pwd",
+            }
+        },
+        {
+            "module": "new_cdc.worker",
+            "action": "bulk chunk-1",
+            "client_identifier": "worker-1 migration=mid-1 chunk=chunk-1",
+        },
+    )
+
+    assert result is conn
+    assert conn.module == "new_cdc.worker"
+    assert conn.action == "bulk chunk-1"
+    assert conn.client_identifier == "worker-1 migration=mid-1 chunk=chunk-1"
+
+
+def test_chunk_is_active_false_when_migration_is_cancelling():
+    conn = ConnStub(row=("RUNNING", "CANCELLING"))
+
+    assert worker_common.chunk_is_active(conn, "chunk-1") is False
+    sql, params = conn.cur.executed[0]
+    assert "JOIN   migrations m ON m.migration_id = c.migration_id" in sql
+    assert params == ("chunk-1",)
+
+
+def test_cancel_chunk_marks_active_chunk_cancelled():
+    conn = ConnStub()
+
+    worker_common.cancel_chunk(conn, "chunk-1", "migration cancelled")
+
+    sql, params = conn.cur.executed[0]
+    assert "SET    status       = 'CANCELLED'" in sql
+    assert params == ("migration cancelled", "chunk-1")
+    assert conn.committed is True
 
 
 def test_claim_cdc_migration_persists_exact_worker_topic(monkeypatch):

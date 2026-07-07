@@ -22,6 +22,14 @@ import common as db
 from common import WORKER_ID
 
 
+def _session_context(action: str, *, job_id: str, object_name: str) -> dict:
+    return {
+        "module": "new_cdc.worker",
+        "action": action,
+        "client_identifier": f"ddl={job_id[:8]} worker={WORKER_ID} object={object_name}",
+    }
+
+
 # DBMS_METADATA object-type names — uses underscores (TABLE, PACKAGE_BODY,
 # MATERIALIZED_VIEW, DB_LINK, ...) while our table stores the canonical form
 # with spaces (MATERIALIZED VIEW, DATABASE LINK).
@@ -196,8 +204,16 @@ def process_ddl_apply_job(job: dict, pg_conn, configs: dict) -> None:
     src_conn = None
     tgt_conn = None
     try:
-        src_conn = db.open_oracle("oracle_source", configs)
-        tgt_conn = db.open_oracle("oracle_target", configs)
+        src_conn = db.open_oracle(
+            "oracle_source",
+            configs,
+            _session_context(f"ddl-src {job_id[:8]}", job_id=job_id, object_name=object_name),
+        )
+        tgt_conn = db.open_oracle(
+            "oracle_target",
+            configs,
+            _session_context(f"ddl-tgt {job_id[:8]}", job_id=job_id, object_name=object_name),
+        )
 
         ddl = _extract_source_ddl(src_conn, src_schema, object_type, object_name)
         ddl = _remap_schema(ddl, src_schema, tgt_schema)

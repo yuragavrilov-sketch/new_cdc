@@ -96,6 +96,32 @@ _CDC_UNAVAILABLE_PLACEHOLDER_B64 = base64.b64encode(
 ).decode("ascii")
 
 
+class ChunkCancelled(RuntimeError):
+    """Raised when a worker notices that an active chunk was cancelled."""
+
+
+def _session_context(action: str, *, migration_id: str | None = None,
+                     chunk_id: str | None = None, table: str | None = None) -> dict:
+    parts = []
+    if migration_id:
+        parts.append(f"mig={migration_id[:8]}")
+    if chunk_id:
+        parts.append(f"chunk={chunk_id[:8]}")
+    parts.append(f"worker={WORKER_ID}")
+    if table:
+        parts.append(f"table={table}")
+    return {
+        "module": "new_cdc.worker",
+        "action": action,
+        "client_identifier": " ".join(parts),
+    }
+
+
+def _ensure_chunk_active(pg_conn, chunk_id: str) -> None:
+    if not db.chunk_is_active(pg_conn, chunk_id):
+        raise ChunkCancelled(f"chunk {chunk_id} cancelled or no longer active")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # BULK LOADING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -155,14 +181,34 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
     start_scn   = int(raw_scn) if raw_scn else None
     rowid_start = chunk["rowid_start"]
     rowid_end   = chunk["rowid_end"]
+    migration_id = str(chunk.get("migration_id") or "")
 
-    src_conn = db.open_oracle(chunk["source_connection_id"], configs)
-    dst_conn = db.open_oracle(chunk["target_connection_id"], configs)
+    src_conn = db.open_oracle(
+        chunk["source_connection_id"],
+        configs,
+        _session_context(
+            f"bulk-src {chunk_id[:8]}",
+            migration_id=migration_id,
+            chunk_id=chunk_id,
+            table=f"{src_schema}.{src_table}",
+        ),
+    )
+    dst_conn = db.open_oracle(
+        chunk["target_connection_id"],
+        configs,
+        _session_context(
+            f"bulk-dst {chunk_id[:8]}",
+            migration_id=migration_id,
+            chunk_id=chunk_id,
+            table=f"{tgt_schema}.{dest_table}",
+        ),
+    )
     rows_loaded = 0
     try:
         with src_conn.cursor() as cur:
             cur.arraysize = BULK_BATCH_SIZE
             cur.prefetchrows = BULK_BATCH_SIZE + 1
+            _ensure_chunk_active(pg_conn, chunk_id)
             if start_scn:
                 # Consistent snapshot via flashback query
                 cur.execute(
@@ -181,14 +227,21 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
             insert_sql, bind_names, lob_inputsizes = _build_insert(
                 cur.description, tgt_schema, dest_table)
             while True:
+                _ensure_chunk_active(pg_conn, chunk_id)
                 rows = cur.fetchmany(BULK_BATCH_SIZE)
                 if not rows:
                     break
+                _ensure_chunk_active(pg_conn, chunk_id)
                 batch = [dict(zip(bind_names, row)) for row in rows]
                 _flush_batch(dst_conn, insert_sql, batch, lob_inputsizes)
                 rows_loaded += len(batch)
                 db.update_chunk_progress(pg_conn, chunk_id, rows_loaded)
                 print(f"  → {rows_loaded} rows")
+    except ChunkCancelled:
+        for c in (src_conn, dst_conn):
+            try: c.rollback()
+            except Exception: pass
+        raise
     finally:
         for c in (src_conn, dst_conn):
             try: c.close()
@@ -211,13 +264,24 @@ def _process_baseline_chunk(chunk: dict, pg_conn, configs: dict) -> int:
     stg_table   = chunk["stage_table"]
     rowid_start = chunk["rowid_start"]
     rowid_end   = chunk["rowid_end"]
+    migration_id = str(chunk.get("migration_id") or "")
 
     tgt = f'"{tgt_schema.upper()}"."{tgt_table.upper()}"'
     stg = f'"{tgt_schema.upper()}"."{stg_table.upper()}"'
 
-    dst_conn = db.open_oracle(chunk["target_connection_id"], configs)
+    dst_conn = db.open_oracle(
+        chunk["target_connection_id"],
+        configs,
+        _session_context(
+            f"baseline {chunk_id[:8]}",
+            migration_id=migration_id,
+            chunk_id=chunk_id,
+            table=f"{tgt_schema}.{tgt_table}",
+        ),
+    )
     rows_loaded = 0
     try:
+        _ensure_chunk_active(pg_conn, chunk_id)
         with dst_conn.cursor() as cur:
             # Conventional (non-direct-path) INSERT so multiple workers write into
             # the target table CONCURRENTLY.
@@ -245,6 +309,12 @@ def _process_baseline_chunk(chunk: dict, pg_conn, configs: dict) -> int:
             )
             rows_loaded = cur.rowcount if cur.rowcount >= 0 else 0
         dst_conn.commit()
+    except ChunkCancelled:
+        try:
+            dst_conn.rollback()
+        except Exception:
+            pass
+        raise
     except Exception as exc:
         if "ORA-00001" in str(exc):
             # A retry after Oracle committed but before PG progress was stored can hit
@@ -316,6 +386,14 @@ def process_chunk(chunk: dict, pg_conn, configs: dict) -> None:
 
         db.complete_chunk(pg_conn, chunk_id, rows_loaded)
         print(f"[worker] chunk {chunk_id} DONE — {rows_loaded} rows")
+
+    except ChunkCancelled as exc:
+        err = str(exc)
+        print(f"[worker] chunk {chunk_id} CANCELLED: {err}")
+        try:
+            db.cancel_chunk(pg_conn, chunk_id, err)
+        except Exception:
+            pass
 
     except Exception as exc:
         err = str(exc)
@@ -678,7 +756,15 @@ def cdc_thread(migration: dict, stop_event: threading.Event) -> None:
             consumer_timeout_ms=CDC_POLL_MS,
             max_poll_records=CDC_BATCH_SIZE,
         )
-        oracle_conn     = db.open_oracle(migration["target_connection_id"], configs)
+        oracle_conn     = db.open_oracle(
+            migration["target_connection_id"],
+            configs,
+            _session_context(
+                f"cdc {migration_id[:8]}",
+                migration_id=migration_id,
+                table=f"{target_schema}.{target_table}",
+            ),
+        )
         binary_cols     = _binary_columns(oracle_conn, target_schema, target_table)
         last_checkin_ts = time.time()
         rows_applied    = 0
@@ -970,7 +1056,15 @@ def process_compare_chunk(chunk: dict, pg_conn, configs: dict) -> None:
           f" ({rowid_start}..{rowid_end})")
 
     try:
-        ora_conn = db.open_oracle(chunk["connection_id"], configs)
+        ora_conn = db.open_oracle(
+            chunk["connection_id"],
+            configs,
+            _session_context(
+                f"compare {chunk_id[:8]}",
+                chunk_id=chunk_id,
+                table=f"{schema}.{table}",
+            ),
+        )
         try:
             columns = _get_comparable_columns(ora_conn, schema, table)
             hash_parts = [f"ORA_HASH({_cmp_col_expr(c['name'], c['data_type'])})"
@@ -1263,7 +1357,14 @@ def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
 
     ora_conn = None
     try:
-        ora_conn = db.open_oracle(target_connection_id, configs)
+        ora_conn = db.open_oracle(
+            target_connection_id,
+            configs,
+            _session_context(
+                f"target-index {job_id[:8]}",
+                table=f"{schema}.{table}",
+            ),
+        )
         result = _enable_target_indexes(ora_conn, schema, table)
         err_count = len(result["errors"]["indexes"]) + len(result["errors"]["constraints"])
         if err_count:

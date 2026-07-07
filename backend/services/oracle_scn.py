@@ -1,7 +1,27 @@
 """Oracle SCN helpers and low-level connection factory."""
 
 
-def open_oracle_conn(cfg: dict):
+_ORACLE_CONTEXT_LIMITS = {
+    "module": 48,
+    "action": 32,
+    "client_identifier": 64,
+}
+
+
+def _apply_session_context(conn, context: dict | None) -> None:
+    if not context:
+        return
+    for key, limit in _ORACLE_CONTEXT_LIMITS.items():
+        value = context.get(key)
+        if not value:
+            continue
+        try:
+            setattr(conn, key, str(value)[:limit])
+        except Exception:
+            pass
+
+
+def open_oracle_conn(cfg: dict, session_context: dict | None = None):
     """
     Open an Oracle connection from a service-config dict.
     cfg keys: host, port (opt, default 1521), service_name, user, password.
@@ -17,19 +37,26 @@ def open_oracle_conn(cfg: dict):
     password     = cfg.get("password", "")
     if not host or not service_name or not user:
         raise ValueError("Oracle connection не настроен — проверьте Настройки")
-    return oracledb.connect(
+    conn = oracledb.connect(
         user=user,
         password=password,
         dsn=f"{host}:{port}/{service_name}",
     )
+    _apply_session_context(conn, session_context)
+    return conn
 
 
-def check_supplemental_logging(cfg: dict, schema: str, table: str) -> bool:
+def check_supplemental_logging(
+    cfg: dict,
+    schema: str,
+    table: str,
+    session_context: dict | None = None,
+) -> bool:
     """
     Return True if the table has at least ALL COLUMNS supplemental logging enabled.
     Required for Debezium LogMiner connector to capture full row images.
     """
-    conn = open_oracle_conn(cfg)
+    conn = open_oracle_conn(cfg, session_context)
     try:
         with conn.cursor() as cur:
             cur.execute("""

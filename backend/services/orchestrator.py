@@ -444,6 +444,18 @@ def _open_source_metadata_conn(connection_id: str):
     return oracle_scn.open_oracle_conn(_oracle_cfg(connection_id))
 
 
+def _oracle_session_context(action: str, migration_id: str, *,
+                            table: str | None = None) -> dict:
+    parts = [f"mig={migration_id[:8]}"]
+    if table:
+        parts.append(f"table={table}")
+    return {
+        "module": "new_cdc.coordinator",
+        "action": action,
+        "client_identifier": " ".join(parts),
+    }
+
+
 def _derive_source_key_from_info(info: dict) -> dict | None:
     pk_columns = info.get("pk_columns") or []
     uk_constraints = info.get("uk_constraints") or []
@@ -742,7 +754,14 @@ def _maybe_reconcile_deferred_fks() -> None:
                         result = {}
 
                     dst_cfg = _oracle_cfg(tgt_conn_id)
-                    ora = oracle_scn.open_oracle_conn(dst_cfg)
+                    ora = oracle_scn.open_oracle_conn(
+                        dst_cfg,
+                        _oracle_session_context(
+                            f"fk-reconcile {str(mid)[:8]}",
+                            str(mid),
+                            table=f"{tgt_schema}.{tgt_table}",
+                        ),
+                    )
                     try:
                         outcome = oracle_browser.enable_disabled_foreign_keys(
                             ora, tgt_schema, tgt_table,
@@ -809,7 +828,14 @@ def _prepare_target_for_direct_load(mid: str, m: dict, dst_cfg: dict, message_pa
     tgt_table = m["target_table"]
     tgt_quoted = f'"{tgt_schema.upper()}"."{tgt_table.upper()}"'
 
-    conn = oracle_scn.open_oracle_conn(dst_cfg)
+    conn = oracle_scn.open_oracle_conn(
+        dst_cfg,
+        _oracle_session_context(
+            f"prepare {mid[:8]}",
+            mid,
+            table=f"{tgt_schema}.{tgt_table}",
+        ),
+    )
     try:
         with conn.cursor() as cur:
             if m.get("truncate_target", True):
@@ -919,7 +945,14 @@ def _create_chunks_and_transition(mid: str, m: dict) -> None:
             )
             if not chunks:
                 # Table might genuinely be empty — check before failing
-                src_conn = oracle_scn.open_oracle_conn(src_cfg)
+                src_conn = oracle_scn.open_oracle_conn(
+                    src_cfg,
+                    _oracle_session_context(
+                        f"chunk-check {mid[:8]}",
+                        mid,
+                        table=f"{m['source_schema']}.{m['source_table']}",
+                    ),
+                )
                 try:
                     with src_conn.cursor() as cur:
                         cur.execute(
@@ -1101,7 +1134,14 @@ def _handle_baseline_publishing(mid: str, m: dict) -> None:
 
             # TRUNCATE target table before loading so retries start from a clean slate
             tgt_quoted = f'"{tgt_schema.upper()}"."{tgt_table.upper()}"'
-            conn = oracle_scn.open_oracle_conn(dst_cfg)
+            conn = oracle_scn.open_oracle_conn(
+                dst_cfg,
+                _oracle_session_context(
+                    f"baseline-pub {mid[:8]}",
+                    mid,
+                    table=f"{tgt_schema}.{tgt_table}",
+                ),
+            )
             try:
                 truncate_result = oracle_browser.truncate_table_for_load(
                     conn, tgt_schema, tgt_table,
@@ -1729,7 +1769,14 @@ def _handle_new(mid: str, m: dict) -> None:
             if strategy.has_cdc:
                 try:
                     has_supp = oracle_scn.check_supplemental_logging(
-                        src_cfg, m["source_schema"], m["source_table"]
+                        src_cfg,
+                        m["source_schema"],
+                        m["source_table"],
+                        _oracle_session_context(
+                            f"supp-log {mid[:8]}",
+                            mid,
+                            table=f"{m['source_schema']}.{m['source_table']}",
+                        ),
                     )
                     if not has_supp:
                         print(
