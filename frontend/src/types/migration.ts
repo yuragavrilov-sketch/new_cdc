@@ -4,6 +4,7 @@ export type Strategy = "CDC_STAGE" | "CDC_DIRECT" | "BULK_STAGE" | "BULK_DIRECT"
 
 export const hasCdc    = (s: Strategy): boolean => s.startsWith("CDC_");
 export const usesStage = (s: Strategy): boolean => s.endsWith("_STAGE");
+export const forcesTargetTruncate = (s: Strategy): boolean => s === "CDC_DIRECT";
 
 export const strategyLabel = (s: Strategy): string =>
   `${hasCdc(s) ? "С CDC" : "Без CDC"} (${usesStage(s) ? "stage" : "direct"})`;

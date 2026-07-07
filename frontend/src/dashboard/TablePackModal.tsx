@@ -84,6 +84,8 @@ export function TablePackModal({
   );
 
   const usesStage = strategy.endsWith("_STAGE");
+  const forcesTargetTruncate = strategy === "CDC_DIRECT";
+  const truncateLocked = usesStage || forcesTargetTruncate;
   const tablesKey = useMemo(
     () => tables.map(x => `${x.source_schema}.${x.source_table}`).join("|"),
     [tables],
@@ -155,8 +157,8 @@ export function TablePackModal({
   }, [initialMode]);
 
   useEffect(() => {
-    if (usesStage && !truncateTarget) setTruncateTarget(true);
-  }, [usesStage, truncateTarget]);
+    if (truncateLocked && !truncateTarget) setTruncateTarget(true);
+  }, [truncateLocked, truncateTarget]);
 
   useEffect(() => {
     if (mode !== "cdc") {
@@ -288,7 +290,7 @@ export function TablePackModal({
         connector_group_id: mode === "cdc" ? cdcGroup?.group_id : undefined,
         strategy,
         sequential: mode === "cdc" ? true : sequential,
-        truncate_target: truncateTarget,
+        truncate_target: truncateLocked ? true : truncateTarget,
         chunk_size: chunkSize,
         max_parallel_workers: workers,
         baseline_parallel_degree: baselinePd,
@@ -772,11 +774,14 @@ export function TablePackModal({
             <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13, color: t.text.primary }}>
               <input
                 type="checkbox"
-                checked={truncateTarget}
-                disabled={usesStage}
+                checked={truncateLocked ? true : truncateTarget}
+                disabled={truncateLocked}
                 onChange={e => setTruncateTarget(e.target.checked)}
               />
-              <span>TRUNCATE target перед загрузкой{usesStage ? " (обязательно для STAGE)" : ""}</span>
+              <span>
+                TRUNCATE target перед загрузкой
+                {usesStage ? " (обязательно для STAGE)" : forcesTargetTruncate ? " (обязательно для CDC_DIRECT)" : ""}
+              </span>
             </label>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
               <Field label="Размер чанка">

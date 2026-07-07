@@ -486,7 +486,7 @@ def test_schema_migration_add_items_route_returns_created_item_states(monkeypatc
         json={
             "strategy": "CDC_DIRECT",
             "tables": [{"source_table": "ALLORDERS"}],
-            "truncate_target": True,
+            "truncate_target": False,
             "max_parallel_workers": 4,
         },
     )
@@ -507,6 +507,16 @@ def test_schema_migration_add_items_route_returns_created_item_states(monkeypatc
         "queue_position": None,
         "error_text": None,
     }]
+    migration_params = next(
+        params for _, sql, params in calls
+        if "INSERT INTO migrations" in sql
+    )
+    assert migration_params[17:20] == ("CDC_DIRECT", True, "gid-1")
+    plan_item_params = next(
+        params for _, sql, params in calls
+        if "INSERT INTO migration_plan_items" in sql
+    )
+    assert json.loads(plan_item_params[5])["truncate_target"] is True
     assert [call[0] for call in calls if call[0] in ("commit", "autostart", "states", "broadcast")] == [
         "commit",
         "autostart",
@@ -2673,6 +2683,108 @@ def test_orchestrator_starts_new_cdc_migration_when_group_running(monkeypatch):
         and "create Kafka topic" in (call[4] or "")
         for call in calls
     )
+
+
+def test_orchestrator_forces_truncate_target_for_cdc_direct(monkeypatch):
+    calls = []
+    observed_truncate_targets = []
+    migration = {
+        "migration_id": "mid-1",
+        "group_id": "gid-1",
+        "phase": "NEW",
+        "strategy": "CDC_DIRECT",
+        "source_connection_id": "oracle_source",
+        "target_connection_id": "oracle_target",
+        "source_schema": "TCBPAY",
+        "source_table": "ALLORDERS",
+        "target_schema": "TCBPAY",
+        "target_table": "ALLORDERS",
+        "stage_table_name": "",
+        "stage_tablespace": "",
+        "source_pk_exists": True,
+        "source_uk_exists": False,
+        "effective_key_columns_json": "[]",
+        "truncate_target": False,
+    }
+
+    class CursorStub:
+        def __init__(self, rows):
+            self.rows = list(rows)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            calls.append(("query", " ".join(sql.split()), params))
+
+        def fetchone(self):
+            return self.rows.pop(0) if self.rows else None
+
+    class ConnStub:
+        def __init__(self):
+            self.cursors = [
+                CursorStub([(0,)]),
+                CursorStub([(1,)]),
+            ]
+
+        def cursor(self):
+            return self.cursors.pop(0)
+
+        def close(self):
+            calls.append(("close",))
+
+    class ImmediateThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    def prepare_target(mid, m, dst_cfg, msg_parts):
+        observed_truncate_targets.append(m.get("truncate_target"))
+        msg_parts.append("target prepared")
+
+    monkeypatch.setitem(orchestrator._state, "get_conn", lambda: ConnStub())
+    monkeypatch.setattr(orchestrator.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(
+        orchestrator.connector_groups_svc,
+        "get_group",
+        lambda group_id: calls.append(("get-group", group_id)) or {
+            "group_id": group_id,
+            "status": "RUNNING",
+            "connector_name": "cdc-main",
+            "topic_prefix": "cdc.topic",
+            "consumer_group_prefix": "cdc.consumer",
+            "run_id": "r123ab",
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_sync_cdc_runtime_context",
+        lambda mid, m, group: {
+            **m,
+            "connector_name": "cdc-main_r123ab",
+            "topic_prefix": "cdc.topic",
+            "consumer_group": "cdc.consumer_TCBPAY_ALLORDERS",
+        },
+    )
+    monkeypatch.setattr(orchestrator, "_update", lambda mid, values: calls.append(("update", mid, values)))
+    monkeypatch.setattr(orchestrator.oracle_scn, "check_supplemental_logging", lambda *_args: True)
+    monkeypatch.setattr(orchestrator, "_oracle_cfg", lambda conn_id: {"conn_id": conn_id})
+    monkeypatch.setattr(orchestrator, "_prepare_target_for_direct_load", prepare_target)
+    monkeypatch.setattr(
+        orchestrator,
+        "_safe_transition",
+        lambda mid, expected, to_phase, message=None, **_kwargs: calls.append(("transition", mid, expected, to_phase, message)),
+    )
+    orchestrator._in_progress.clear()
+
+    orchestrator._handle_new("mid-1", migration)
+
+    assert observed_truncate_targets == [True]
 
 
 def test_orchestrator_starts_second_new_cdc_migration_when_parallel_limit_allows(monkeypatch):

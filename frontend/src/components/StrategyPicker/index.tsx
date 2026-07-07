@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { t } from "../../theme";
-import { Strategy, hasCdc, usesStage, composeStrategy } from "../../types/migration";
+import { Strategy, hasCdc, usesStage, forcesTargetTruncate, composeStrategy } from "../../types/migration";
 
 interface Props {
   value: Strategy;
@@ -15,6 +15,7 @@ export function StrategyPicker({ value, onChange, truncateTarget, onTruncateChan
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const cdc = hasCdc(value);
   const stage = usesStage(value);
+  const truncateLocked = stage || forcesTargetTruncate(value);
 
   const setCdc = (c: boolean) => onChange(composeStrategy(c, stage));
   const setStage = (s: boolean) => onChange(composeStrategy(cdc, s));
@@ -109,18 +110,20 @@ export function StrategyPicker({ value, onChange, truncateTarget, onTruncateChan
               : "Прямая загрузка в target. Target triggers отключаются, вторичные индексы пересчитываются после загрузки."}
           </div>
           <div style={{ paddingTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
-            <label style={{ fontWeight: 500, fontSize: 13, cursor: usesStage(value) ? "not-allowed" : "pointer" }}>
+            <label style={{ fontWeight: 500, fontSize: 13, cursor: truncateLocked ? "not-allowed" : "pointer" }}>
               <input
                 type="checkbox"
-                checked={usesStage(value) ? true : truncateTarget}
-                disabled={usesStage(value)}
+                checked={truncateLocked ? true : truncateTarget}
+                disabled={truncateLocked}
                 onChange={(e) => onTruncateChange(e.target.checked)}
               />
               {" "}Очистить target перед загрузкой (TRUNCATE TABLE)
             </label>
             <div style={{ fontSize: 12, color: t.text.muted }}>
-              {usesStage(value)
+              {stage
                 ? "Всегда ON для STAGE — таблица очищается перед публикацией baseline."
+                : forcesTargetTruncate(value)
+                  ? "Всегда ON для CDC_DIRECT — target очищается перед direct baseline."
                 : "Если выключено — данные дописываются поверх существующего (возможны PK-конфликты)."}
             </div>
           </div>

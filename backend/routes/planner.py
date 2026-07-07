@@ -571,6 +571,9 @@ def add_plan_items(plan_id):
                             "error": f"Invalid truncate_target for {table_name}: "
                                      "STAGE-стратегия требует TRUNCATE target."
                         }), 400
+                    if strategy.forces_target_truncate:
+                        truncate_target = True
+                        overrides = {**overrides, "truncate_target": True}
                     baseline_pd = overrides.get("baseline_parallel_degree", defaults.get("baseline_parallel_degree", 4))
 
                     mid = str(uuid.uuid4())
@@ -727,6 +730,9 @@ def execute_plan():
                             "error": f"Invalid truncate_target for {table_name}: "
                                      "STAGE-стратегия требует TRUNCATE target (поведение неизменяемо)."
                         }), 400
+                    if strategy.forces_target_truncate:
+                        truncate_target = True
+                        overrides = {**overrides, "truncate_target": True}
                     baseline_pd = overrides.get("baseline_parallel_degree", defaults.get("baseline_parallel_degree", 4))
 
                     mid = str(uuid.uuid4())

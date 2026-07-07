@@ -749,6 +749,8 @@ def create_migrations_for_group_tables(
     if strategy.uses_stage and not truncate_target:
         raise ValueError(
             "STAGE-стратегия требует TRUNCATE target — поведение неизменяемо")
+    if strategy.forces_target_truncate:
+        truncate_target = True
 
     group = get_group(group_id)
     if not group:

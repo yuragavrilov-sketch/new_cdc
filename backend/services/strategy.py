@@ -23,6 +23,10 @@ class Strategy(str, Enum):
     def uses_stage(self) -> bool:
         return self.value.endswith("_STAGE")
 
+    @property
+    def forces_target_truncate(self) -> bool:
+        return self is Strategy.CDC_DIRECT
+
     @classmethod
     def parse(cls, raw: str | None) -> "Strategy":
         """Strict parser: raises ValueError on unknown/empty value.

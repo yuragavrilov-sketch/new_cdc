@@ -917,6 +917,8 @@ def add_plan_items(sm_id: str):
     truncate_target = bool(payload.get("truncate_target", True))
     if strategy.uses_stage and not truncate_target:
         return jsonify({"error": "STAGE strategy requires truncate_target=true"}), 400
+    if strategy.forces_target_truncate:
+        truncate_target = True
     connector_group_id = payload.get("connector_group_id") or None
     prune_cdc_pack = payload.get("prune_cdc_pack") is True and strategy.has_cdc
 

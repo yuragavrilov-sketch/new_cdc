@@ -1659,6 +1659,10 @@ def _handle_new(mid: str, m: dict) -> None:
               "NO_KEY_COLUMNS")
         return
 
+    if strategy.forces_target_truncate and not m.get("truncate_target", True):
+        print(f"[orchestrator] {mid}: {strategy.value} forces target truncate")
+        m = {**m, "truncate_target": True}
+
     # CDC migrations are queue candidates only after their CDC runtime is RUNNING.
     if strategy.has_cdc:
         group = connector_groups_svc.get_group(m["group_id"])
