@@ -208,6 +208,14 @@ export function DDLCatalog({ onOpenMigration }: { onOpenMigration?: () => void }
   }, [snapshotId, srcSchema, tgtSchema, activeTab, loadObjectsForTab]);
 
   const doSync = useCallback((type: string, name: string, action: string) => {
+    if (type === "TABLE" && action === "sync_cols") {
+      const ok = window.confirm(
+        `Синхронизировать DDL колонок для ${name}?\n\n`
+        + "Будут добавлены отсутствующие колонки и удалены лишние колонки на target.\n"
+        + "Несовпадение типов будет показано предупреждением и автоматически не меняется.",
+      );
+      if (!ok) return;
+    }
     setSyncBusy(prev => new Set(prev).add(name));
 
     if (type === "TABLE") {

@@ -6,7 +6,16 @@ import {
 import { useApi } from "../hooks/useApi";
 import { fmtCompactNum, fmtMb } from "../utils/format";
 import { STATUS_MAP, OBJECT_TYPES, type SchemaObject, type MigrationEvent } from "./types";
-import { addDdlPackItems, type DdlApplyAction, type ObjectDetailResp, type DdlDetailResp, type MigrationDetailResp } from "./api";
+import {
+  addDdlPackItems,
+  loadCatalogSnapshot,
+  syncTargetColumns,
+  type DdlApplyAction,
+  type ObjectDetailResp,
+  type DdlDetailResp,
+  type MigrationDetailResp,
+  type SyncTargetColumnsResp,
+} from "./api";
 import { DiffSections } from "./DiffSections";
 import { primaryActionStyle } from "./buttonStyles";
 import { PACK_DEFINITIONS, type TablePackAddMode } from "./packModel";
@@ -105,6 +114,38 @@ function detectApplyAction(
   return null;
 }
 
+function tableColumnDiffDetail(detail: ObjectDetailResp | null): DdlDetailResp | null {
+  const d = detail?.kind === "ddl"
+    ? detail
+    : detail?.kind === "migration"
+      ? detail.ddl_diff
+      : null;
+  if (!d || !d.found || d.object_type !== "TABLE") return null;
+  const diff = d.diff || {};
+  const count = (v: unknown) => Array.isArray(v) ? v.length : 0;
+  const columnIssues =
+    count(diff.cols_missing) +
+    count(diff.cols_extra) +
+    count(diff.cols_type);
+  return columnIssues > 0 ? d : null;
+}
+
+function syncColumnsFeedback(result: SyncTargetColumnsResp): string {
+  const parts = [
+    `+${result.added?.length || 0}`,
+    `-${result.dropped?.length || 0}`,
+  ];
+  const warnings = result.warnings?.length || 0;
+  const dropErrors = result.drop_errors?.length || 0;
+  if (warnings) parts.push(`типов: ${warnings}`);
+  if (dropErrors) parts.push(`ошибок DROP: ${dropErrors}`);
+  return `DDL колонки: ${parts.join(", ")}`;
+}
+
+function messageFromError(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 export function ObjectDrawer({
   schemaMigrationId, object: o, events,
   srcSchema, tgtSchema,
@@ -121,7 +162,11 @@ export function ObjectDrawer({
   );
   const [applyBusy,     setApplyBusy]     = useState(false);
   const [applyFeedback, setApplyFeedback] = useState<string | null>(null);
+  const [columnSyncBusy, setColumnSyncBusy] = useState(false);
+  const [columnSyncFeedback, setColumnSyncFeedback] = useState<string | null>(null);
   const applyOpt = detectApplyAction(o, detail.data);
+  const columnDiffDetail = tableColumnDiffDetail(detail.data);
+  const canSyncColumns = !!columnDiffDetail && !!srcSchema && !!tgtSchema;
 
   // Derive Oracle "all_errors" query params for compilable PL/SQL objects.
   // Only fired when the object is INVALID on that side.
@@ -169,6 +214,43 @@ export function ObjectDrawer({
       setApplyFeedback(`ошибка: ${(e as Error).message}`);
     } finally {
       setApplyBusy(false);
+    }
+  };
+
+  const runColumnSync = async () => {
+    if (!columnDiffDetail || !srcSchema || !tgtSchema) return;
+    const diff = columnDiffDetail.diff || {};
+    const missing = Array.isArray(diff.cols_missing) ? diff.cols_missing.length : 0;
+    const extra = Array.isArray(diff.cols_extra) ? diff.cols_extra.length : 0;
+    const type = Array.isArray(diff.cols_type) ? diff.cols_type.length : 0;
+    const ok = window.confirm(
+      `Синхронизировать DDL колонок для ${columnDiffDetail.object_name}?\n\n`
+      + `Будет добавлено: ${missing}, удалено с target: ${extra}, несовпадений типов: ${type}.\n`
+      + "Типы колонок автоматически не меняются.",
+    );
+    if (!ok) return;
+    setColumnSyncBusy(true);
+    setColumnSyncFeedback(null);
+    try {
+      const result = await syncTargetColumns({
+        src_schema: srcSchema,
+        src_table:  columnDiffDetail.object_name,
+        tgt_schema: tgtSchema,
+        tgt_table:  columnDiffDetail.object_name,
+      });
+      let feedback = syncColumnsFeedback(result);
+      try {
+        await loadCatalogSnapshot(srcSchema, tgtSchema);
+      } catch (e) {
+        feedback += `; snapshot: ${messageFromError(e)}`;
+      }
+      setColumnSyncFeedback(feedback);
+      detail.reload();
+      onApplied?.();
+    } catch (e) {
+      setColumnSyncFeedback(`ошибка: ${messageFromError(e)}`);
+    } finally {
+      setColumnSyncBusy(false);
     }
   };
   const status = o.status;
@@ -287,6 +369,17 @@ export function ObjectDrawer({
                 </button>
               </>
             )}
+            {canSyncColumns && (
+              <button
+                onClick={runColumnSync}
+                disabled={columnSyncBusy}
+                title="Добавить отсутствующие и удалить лишние колонки на target; типы не меняются автоматически"
+                style={primaryActionStyle(columnSyncBusy)}
+              >
+                <Icon name="rotate" size={13}/>
+                {columnSyncBusy ? "синхр..." : "Синхр. DDL"}
+              </button>
+            )}
             {applyOpt && (
               <button
                 onClick={runApply}
@@ -300,13 +393,13 @@ export function ObjectDrawer({
                 {applyBusy ? "добавляю..." : "В DDL-пачку"}
               </button>
             )}
-            {applyFeedback && (
+            {(columnSyncFeedback || applyFeedback) && (
               <span style={{
                 fontSize: 11, color: t.text.muted, fontFamily: t.font.mono,
                 maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis",
                 whiteSpace: "nowrap",
               }}>
-                {applyFeedback}
+                {columnSyncFeedback || applyFeedback}
               </span>
             )}
             {status === "running" && (
@@ -377,6 +470,16 @@ export function ObjectDrawer({
                 </div>
               </div>
               <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                {canSyncColumns && (
+                  <button
+                    onClick={runColumnSync}
+                    disabled={columnSyncBusy}
+                    style={primaryActionStyle(columnSyncBusy)}
+                  >
+                    <Icon name="rotate" size={13}/>
+                    {columnSyncBusy ? "синхр..." : "Синхр. DDL"}
+                  </button>
+                )}
                 {applyOpt && (
                   <button
                     onClick={runApply}
@@ -387,9 +490,9 @@ export function ObjectDrawer({
                     {applyBusy ? "очередь…" : applyOpt.label}
                   </button>
                 )}
-                {applyFeedback && (
+                {(columnSyncFeedback || applyFeedback) && (
                   <span style={{ fontSize: 11, color: t.text.muted, fontFamily: t.font.mono }}>
-                    {applyFeedback}
+                    {columnSyncFeedback || applyFeedback}
                   </span>
                 )}
               </div>

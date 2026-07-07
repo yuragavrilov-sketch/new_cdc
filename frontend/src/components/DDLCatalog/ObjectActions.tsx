@@ -49,9 +49,10 @@ export function ObjectActions({
           <button
             onClick={() => onSync(objectType, objectName, "sync_cols")}
             disabled={busy}
+            title="Синхронизировать DDL колонок: добавить отсутствующие и удалить лишние на target"
             style={{ ...S.btnSuccess, ...btnSmall, opacity: busy ? 0.5 : 1 }}
           >
-            Колонки
+            {busy ? "..." : "Синхр. DDL"}
           </button>
           <button
             onClick={() => onSync(objectType, objectName, "sync_objects")}

@@ -112,6 +112,50 @@ export async function rollback(id: string): Promise<number> {
   return j.affected as number;
 }
 
+export interface TargetPrepTableRef {
+  src_schema: string;
+  src_table:  string;
+  tgt_schema: string;
+  tgt_table:  string;
+}
+
+export interface SyncTargetColumnsResp {
+  added:       Array<{ column: string; type: string }>;
+  dropped:     string[];
+  drop_errors: Array<{ column: string; error: string }>;
+  warnings:    Array<{ column: string; source_type: string; target_type: string; note?: string }>;
+}
+
+async function errorFromResponse(r: Response): Promise<Error> {
+  const text = await r.text().catch(() => "");
+  if (!text) return new Error(`HTTP ${r.status}`);
+  try {
+    const parsed = JSON.parse(text) as { error?: string };
+    return new Error(parsed.error || text);
+  } catch {
+    return new Error(text);
+  }
+}
+
+export async function syncTargetColumns(payload: TargetPrepTableRef): Promise<SyncTargetColumnsResp> {
+  const r = await fetch("/api/target-prep/sync-columns", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify(payload),
+  });
+  if (!r.ok) throw await errorFromResponse(r);
+  return r.json();
+}
+
+export async function loadCatalogSnapshot(srcSchema: string, tgtSchema: string): Promise<void> {
+  const r = await fetch("/api/catalog/load", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ src_schema: srcSchema, tgt_schema: tgtSchema }),
+  });
+  if (!r.ok) throw await errorFromResponse(r);
+}
+
 export type DdlApplyAction = "create_missing" | "sync_diff" | "recreate";
 
 export interface DdlApplyResp {

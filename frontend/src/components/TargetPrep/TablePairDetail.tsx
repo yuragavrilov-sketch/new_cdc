@@ -24,6 +24,8 @@ export function TablePairDetail({
   const [syncBusy,      setSyncBusy]      = useState(false);
   const [syncResult,    setSyncResult]    = useState<{
     added:    { column: string; type: string }[];
+    dropped:  string[];
+    drop_errors: { column: string; error: string }[];
     warnings: { column: string; source_type: string; target_type: string }[];
   } | null>(null);
   const [syncObjBusy,   setSyncObjBusy]   = useState<string | null>(null);
@@ -34,6 +36,16 @@ export function TablePairDetail({
   const [detailError,   setDetailError]   = useState<string | null>(null);
 
   const doSyncColumns = useCallback(async () => {
+    const srcNames = new Set(ddl.source.columns.map(c => c.name));
+    const extraCount = ddl.target.columns.filter(c => !srcNames.has(c.name)).length;
+    if (extraCount > 0) {
+      const ok = window.confirm(
+        `Синхронизировать DDL колонок для ${srcTable}?\n\n`
+        + `На target будет удалено лишних колонок: ${extraCount}.\n`
+        + "Несовпадение типов будет показано предупреждением и автоматически не меняется.",
+      );
+      if (!ok) return;
+    }
     setSyncBusy(true); setSyncResult(null); setDetailError(null);
     try {
       const r = await fetch("/api/target-prep/sync-columns", {
@@ -46,7 +58,7 @@ export function TablePairDetail({
       onRefresh();
     } catch (e: any) { setDetailError(e.message); }
     finally { setSyncBusy(false); }
-  }, [srcSchema, srcTable, tgtSchema, tgtTable, onRefresh]);
+  }, [ddl, srcSchema, srcTable, tgtSchema, tgtTable, onRefresh]);
 
   const doSyncObjects = useCallback(async (type: "constraints" | "indexes" | "triggers") => {
     setSyncObjBusy(type); setSyncObjResult(null); setDetailError(null);
@@ -146,8 +158,8 @@ export function TablePairDetail({
         title="Колонки" count={ddl.source.columns.length}
         status={colIssues === 0 ? "ok" : "warn"}
         bulkAction={
-          colDiff.some(r => r.state === "noTgt")
-            ? <ActionBtn label="Добавить недостающие колонки" onClick={doSyncColumns} busy={syncBusy} variant="success" />
+          colDiff.some(r => r.state === "noTgt" || r.state === "extra")
+            ? <ActionBtn label="Синхронизировать DDL колонок" onClick={doSyncColumns} busy={syncBusy} variant="success" />
             : undefined
         }
       >
@@ -232,12 +244,25 @@ export function TablePairDetail({
                 ✓ Добавлено: {syncResult.added.map(a => `${a.column} (${a.type})`).join(", ")}
               </div>
             )}
+            {syncResult.dropped.length > 0 && (
+              <div style={{ color: t.amber.base, marginBottom: 4 }}>
+                − Удалено с target: {syncResult.dropped.join(", ")}
+              </div>
+            )}
+            {syncResult.drop_errors.length > 0 && (
+              <div style={{ color: t.red.base, marginBottom: 4 }}>
+                DROP ошибки: {syncResult.drop_errors.map(e => `${e.column}: ${e.error}`).join("; ")}
+              </div>
+            )}
             {syncResult.warnings.length > 0 && (
               <div style={{ color: t.amber.base }}>
                 ⚠ Несовпадение типов (не применено): {syncResult.warnings.map(w => `${w.column}: src=${w.source_type} / tgt=${w.target_type}`).join("; ")}
               </div>
             )}
-            {syncResult.added.length === 0 && syncResult.warnings.length === 0 && (
+            {syncResult.added.length === 0
+              && syncResult.dropped.length === 0
+              && syncResult.drop_errors.length === 0
+              && syncResult.warnings.length === 0 && (
               <span style={{ color: t.text.disabled }}>Нет изменений</span>
             )}
           </div>

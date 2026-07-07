@@ -25,6 +25,8 @@ import {
   addDdlPackItems,
   startDdlPack,
   listDdlJobs,
+  syncTargetColumns,
+  loadCatalogSnapshot,
 } from "./api";
 import type { DdlApplyAction, DdlJob } from "./api";
 
@@ -188,6 +190,10 @@ function cdcItemStateNote(response: AddPlanItemsResp, fallbackCount: number, con
     : ` · CDC: ${fallbackCount} таблиц`;
 }
 
+function messageFromError(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 interface Props {
   selectedId:        string | null;
   schema:            SchemaMigrationListItem | null;
@@ -237,6 +243,8 @@ export function Dashboard({
   const [toast,               setToast]               = useState<string>("");
   const [ddlSyncFeedback,     setDdlSyncFeedback]     = useState<string>("");
   const [ddlPackBusy,         setDdlPackBusy]         = useState(false);
+  const [ddlColumnSyncBusy,   setDdlColumnSyncBusy]   = useState(false);
+  const [ddlColumnSyncFeedback, setDdlColumnSyncFeedback] = useState("");
 
   // Fetch objects and events for this schema migration (auto-poll 5s)
   const objectsApi = useApi<SchemaObject[]>(
@@ -495,6 +503,71 @@ export function Dashboard({
     });
     return out;
   }, [selectedIds, objects, isTablesGroup]);
+
+  const handleSyncSelectedTableColumns = useCallback(async () => {
+    if (!selectedTables.length || !schema) return;
+    const ok = window.confirm(
+      `Синхронизировать DDL колонок для ${selectedTables.length} таблиц?\n\n`
+      + "Будут добавлены отсутствующие колонки и удалены лишние колонки на target.\n"
+      + "Несовпадение типов будет показано предупреждением и автоматически не меняется.",
+    );
+    if (!ok) return;
+
+    setDdlColumnSyncBusy(true);
+    setDdlColumnSyncFeedback(`DDL колонки: синхронизация ${selectedTables.length} таблиц...`);
+    let synced = 0;
+    let added = 0;
+    let dropped = 0;
+    let warnings = 0;
+    let dropErrors = 0;
+    const errors: string[] = [];
+
+    try {
+      for (const table of selectedTables) {
+        try {
+          const result = await syncTargetColumns({
+            src_schema: table.source_schema,
+            src_table:  table.source_table,
+            tgt_schema: table.target_schema,
+            tgt_table:  table.target_table,
+          });
+          synced += 1;
+          added += result.added?.length || 0;
+          dropped += result.dropped?.length || 0;
+          warnings += result.warnings?.length || 0;
+          dropErrors += result.drop_errors?.length || 0;
+        } catch (e) {
+          errors.push(`${table.source_table}: ${messageFromError(e)}`);
+        }
+      }
+
+      if (schema.src_schema && schema.tgt_schema) {
+        try {
+          await loadCatalogSnapshot(schema.src_schema, schema.tgt_schema);
+        } catch (e) {
+          errors.push(`snapshot: ${messageFromError(e)}`);
+        }
+      }
+
+      const parts = [
+        `DDL колонки: ${synced}/${selectedTables.length}`,
+        `+${added}`,
+        `-${dropped}`,
+      ];
+      if (warnings) parts.push(`типов: ${warnings}`);
+      if (dropErrors) parts.push(`ошибок DROP: ${dropErrors}`);
+      if (errors.length) parts.push(`ошибок: ${errors.length}`);
+      const feedback = parts.join(", ");
+      setDdlColumnSyncFeedback(feedback);
+      setToast(errors.length ? `${feedback}: ${errors.slice(0, 2).join("; ")}` : feedback);
+      if (!errors.length) setSelectedIds(new Set());
+      objectsApi.reload();
+      eventsApi.reload();
+      setTimeout(() => setToast(""), 5000);
+    } finally {
+      setDdlColumnSyncBusy(false);
+    }
+  }, [selectedTables, schema, objectsApi, eventsApi]);
 
   // Stable handlers (so React.memo on ObjectRow can skip re-renders)
   const handleOpen = useCallback((o: SchemaObject) => setOpenObject(o), []);
@@ -782,23 +855,38 @@ export function Dashboard({
       {
         key: PACK_DEFINITIONS.ddl.key,
         title: PACK_DEFINITIONS.ddl.title,
-        subtitle: isTablesGroup ? PACK_DEFINITIONS.ddl.subtitle : `Текущий раздел: ${activeGroup.label}`,
+        subtitle: isTablesGroup
+          ? "Колонки таблиц: добавить отсутствующие, удалить лишние"
+          : `Текущий раздел: ${activeGroup.label}`,
         tone: PACK_DEFINITIONS.ddl.tone,
         ...ddlCounts,
-        selected: selectedDdlCount,
+        selected: isTablesGroup ? selectedTableCount : selectedDdlCount,
         actions: [
-          {
-            label: selectedDdlCount
-              ? `В пачку · ${selectedDdlCount}`
-              : ddlSyncActionable
-                ? `В пачку · ${ddlSyncActionable}`
-                : "В пачку",
-            onClick: selectedDdlCount
-              ? () => openDdlPackModal(selectedDdlObjects)
-              : handleAddFilteredDdlToPack,
-            disabled: isTablesGroup || ddlPackBusy || (selectedDdlCount === 0 && ddlSyncActionable === 0),
-            disabledReason: isTablesGroup ? "DDL-пачка доступна в разделах DDL-объектов" : "Нет DDL-объектов для добавления",
-          },
+          isTablesGroup
+            ? {
+              label: ddlColumnSyncBusy
+                ? "Синхр..."
+                : selectedTableCount
+                  ? `Синхр. DDL · ${selectedTableCount}`
+                  : "Синхр. DDL",
+              onClick: handleSyncSelectedTableColumns,
+              disabled: ddlColumnSyncBusy || selectedTableCount === 0,
+              primary: selectedTableCount > 0,
+              hint: "Добавить отсутствующие и удалить лишние колонки на target; типы не меняются автоматически",
+              disabledReason: "Выберите таблицы для синхронизации колонок",
+            }
+            : {
+              label: selectedDdlCount
+                ? `В пачку · ${selectedDdlCount}`
+                : ddlSyncActionable
+                  ? `В пачку · ${ddlSyncActionable}`
+                  : "В пачку",
+              onClick: selectedDdlCount
+                ? () => openDdlPackModal(selectedDdlObjects)
+                : handleAddFilteredDdlToPack,
+              disabled: ddlPackBusy || (selectedDdlCount === 0 && ddlSyncActionable === 0),
+              disabledReason: "Нет DDL-объектов для добавления",
+            },
           {
             label: ddlPackBusy ? "Запуск..." : "Запустить",
             onClick: handleStartDdlPack,
@@ -811,7 +899,7 @@ export function Dashboard({
             onClick: onOpenPacks,
           },
         ],
-        feedback: ddlSyncFeedback,
+        feedback: ddlColumnSyncFeedback || ddlSyncFeedback,
       },
     ];
   }, [
@@ -826,13 +914,16 @@ export function Dashboard({
     activeGroup.label,
     ddlSyncActionable,
     ddlPackBusy,
+    ddlColumnSyncBusy,
     ddlDraftJobs,
     ddlSyncFeedback,
+    ddlColumnSyncFeedback,
     handleStartPackQueue,
     onOpenPacks,
     openDdlPackModal,
     handleAddFilteredDdlToPack,
     handleStartDdlPack,
+    handleSyncSelectedTableColumns,
   ]);
 
   // Empty state
@@ -924,9 +1015,11 @@ export function Dashboard({
       {isTablesGroup && selectedIds.size > 0 && (
         <BulkSelectionBar
           count={selectedIds.size}
+          ddlBusy={ddlColumnSyncBusy}
           onClear={() => setSelectedIds(new Set())}
           onCdcPack={() => setPackMode("cdc")}
           onBulkPack={() => setPackMode("historical")}
+          onSyncDdl={handleSyncSelectedTableColumns}
         />
       )}
 
@@ -1138,9 +1231,13 @@ function DdlSelectionBar({ count, busy, onClear, onAdd }: {
   );
 }
 
-function BulkSelectionBar({ count, onClear, onCdcPack, onBulkPack }: {
-  count: number; onClear: () => void;
-  onCdcPack: () => void; onBulkPack: () => void;
+function BulkSelectionBar({ count, ddlBusy, onClear, onCdcPack, onBulkPack, onSyncDdl }: {
+  count: number;
+  ddlBusy: boolean;
+  onClear: () => void;
+  onCdcPack: () => void;
+  onBulkPack: () => void;
+  onSyncDdl: () => void;
 }) {
   return (
     <div style={{
@@ -1167,6 +1264,9 @@ function BulkSelectionBar({ count, onClear, onCdcPack, onBulkPack }: {
       </button>
       <button onClick={onBulkPack} style={secondaryActionStyle()}>
         В {PACK_DEFINITIONS.bulk.title.toLowerCase()} ({count})
+      </button>
+      <button onClick={onSyncDdl} disabled={ddlBusy} style={secondaryActionStyle(ddlBusy)}>
+        {ddlBusy ? "Синхр..." : `Синхр. DDL (${count})`}
       </button>
     </div>
   );
