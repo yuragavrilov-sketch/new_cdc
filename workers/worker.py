@@ -281,6 +281,14 @@ def _cursor_description_summary(description, limit: int = 2000) -> str:
 
 
 _ORACLE_PROTOCOL_ERRORS = ("ORA-03106", "ORA-03113", "ORA-03114")
+_ORACLE_CONNECTION_ERRORS = (
+    "DPY-1001",
+    "DPY-4011",
+    "ORA-03106",
+    "ORA-03113",
+    "ORA-03114",
+    "ORA-03135",
+)
 _ORA00001_CONSTRAINT_RE = re.compile(
     r"unique constraint\s*\((?P<constraint>[^)]+)\)\s*violated",
     re.IGNORECASE,
@@ -297,7 +305,23 @@ def _is_ora00001(exc: Exception) -> bool:
 
 
 def _is_dpy_not_connected(exc: Exception) -> bool:
-    return "DPY-1001" in str(exc) or "not connected to database" in str(exc).lower()
+    text = str(exc)
+    lowered = text.lower()
+    return (
+        any(code in text for code in _ORACLE_CONNECTION_ERRORS)
+        or "not connected to database" in lowered
+        or "database or network closed the connection" in lowered
+    )
+
+
+def _oracle_connection_error_code(exc: Exception) -> str:
+    text = str(exc)
+    for code in _ORACLE_CONNECTION_ERRORS:
+        if code in text:
+            return code
+    if "not connected to database" in text.lower():
+        return "DPY-1001"
+    return "CONNECTION_LOST"
 
 
 def _parse_ora00001_constraint(exc: Exception, default_owner: str) -> tuple[str | None, str | None]:
@@ -2091,7 +2115,14 @@ def _target_index_log(tag: str | None, message: str) -> None:
         print(f"[target_index] {tag} {message}", flush=True)
 
 
-def _enable_target_indexes(conn, schema: str, table: str, *, tag: str | None = None) -> dict:
+def _enable_target_indexes(
+    conn,
+    schema: str,
+    table: str,
+    *,
+    tag: str | None = None,
+    parallel_rebuild_override: bool | None = None,
+) -> dict:
     s = schema.upper()
     t = table.upper()
     stage = "temporary-probe"
@@ -2099,7 +2130,12 @@ def _enable_target_indexes(conn, schema: str, table: str, *, tag: str | None = N
         _target_index_log(tag, f"stage={stage} table={s}.{t}")
         is_temp = _is_temporary_table(conn, s, t)
         # PARALLEL only for real tables (GTT indexes can't be NOLOGGING/parallel here).
-        parallel_rebuild = INDEX_REBUILD_PARALLEL and not is_temp
+        parallel_enabled = (
+            INDEX_REBUILD_PARALLEL
+            if parallel_rebuild_override is None
+            else bool(parallel_rebuild_override)
+        )
+        parallel_rebuild = parallel_enabled and not is_temp
         if is_temp:
             rebuild_clause = "REBUILD"
         elif parallel_rebuild:
@@ -2109,7 +2145,7 @@ def _enable_target_indexes(conn, schema: str, table: str, *, tag: str | None = N
         _target_index_log(
             tag,
             f"table temporary={is_temp} parallel_rebuild={parallel_rebuild} "
-            f"rebuild_clause={rebuild_clause}",
+            f"parallel_override={parallel_rebuild_override} rebuild_clause={rebuild_clause}",
         )
         enabled = {"indexes": [], "constraints": [], "fk_novalidate": [], "referencing_fk_novalidate": []}
         errors = {"indexes": [], "constraints": []}
@@ -2265,9 +2301,19 @@ def _log_target_index_failure_diagnostics(
     )
     if _is_dpy_not_connected(exc):
         print(
-            f"[target_index] {tag} DPY-1001 target_conn {_connection_health(ora_conn)}",
+            f"[target_index] {tag} {_oracle_connection_error_code(exc)} target_conn "
+            f"{_connection_health(ora_conn)}",
             flush=True,
         )
+
+
+def _close_quietly(obj) -> None:
+    if obj is None:
+        return
+    try:
+        obj.close()
+    except Exception:
+        pass
 
 
 def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
@@ -2294,7 +2340,35 @@ def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
             ),
         )
         stage = "enable-target-indexes"
-        result = _enable_target_indexes(ora_conn, schema, table, tag=tag)
+        try:
+            result = _enable_target_indexes(ora_conn, schema, table, tag=tag)
+        except Exception as exc:
+            code = _oracle_connection_error_code(exc)
+            serial_retry_codes = {"DPY-4011", "ORA-03106", "ORA-03113", "ORA-03114", "ORA-03135"}
+            if INDEX_REBUILD_PARALLEL and code in serial_retry_codes:
+                print(
+                    f"[target_index] {tag} {code} during parallel index enable; "
+                    "retrying once with serial rebuild",
+                    flush=True,
+                )
+                _close_quietly(ora_conn)
+                ora_conn = db.open_oracle(
+                    target_connection_id,
+                    configs,
+                    _session_context(
+                        f"target-index-serial {job_id[:8]}",
+                        table=f"{schema}.{table}",
+                    ),
+                )
+                result = _enable_target_indexes(
+                    ora_conn,
+                    schema,
+                    table,
+                    tag=tag,
+                    parallel_rebuild_override=False,
+                )
+            else:
+                raise
         err_count = len(result["errors"]["indexes"]) + len(result["errors"]["constraints"])
         if err_count:
             names = [e["name"] for e in result["errors"]["indexes"]]
