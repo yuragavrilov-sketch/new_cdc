@@ -1026,6 +1026,37 @@ def disable_referencing_foreign_keys(conn, schema: str, table: str) -> list[str]
     return disabled
 
 
+def disable_own_foreign_keys(conn, schema: str, table: str) -> list[str]:
+    """Disable enabled outbound FKs defined on *schema.table*.
+
+    Bulk/direct loads must not validate parent rows while a schema pack is still
+    loading tables in parallel; the corresponding enable path uses NOVALIDATE.
+    Returns display names in OWNER.TABLE.CONSTRAINT form.
+    """
+    s = schema.upper()
+    t = table.upper()
+    disabled: list[str] = []
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT constraint_name
+            FROM   all_constraints
+            WHERE  owner = :s
+              AND  table_name = :t
+              AND  constraint_type = 'R'
+              AND  status = 'ENABLED'
+            ORDER BY constraint_name
+        """, {"s": s, "t": t})
+        constraints = [row[0] for row in cur.fetchall()]
+
+        for constraint_name in constraints:
+            cur.execute(
+                f'ALTER TABLE "{s}"."{t}" DISABLE CONSTRAINT "{constraint_name}"'
+            )
+            disabled.append(f"{s}.{t}.{constraint_name}")
+    conn.commit()
+    return disabled
+
+
 def disable_key_constraints_cascade(conn, schema: str, table: str) -> list[str]:
     """Disable enabled PK/UK constraints on *schema.table* with CASCADE.
 
@@ -1065,6 +1096,7 @@ def truncate_table_for_load(conn, schema: str, table: str) -> dict:
     """
     s = schema.upper()
     t = table.upper()
+    disabled_own_fk = disable_own_foreign_keys(conn, s, t)
     disabled_ref_fk = disable_referencing_foreign_keys(conn, s, t)
     disabled_keys = disable_key_constraints_cascade(conn, s, t)
     qname = f'"{s}"."{t}"'
@@ -1085,11 +1117,13 @@ def truncate_table_for_load(conn, schema: str, table: str) -> dict:
             visible = [f"<lookup failed: {lookup_exc}>"]
         raise RuntimeError(
             f"ORA-02266 while truncating {s}.{t}; "
+            f"disabled_own_fk={disabled_own_fk}; "
             f"disabled_ref_fk={disabled_ref_fk}; disabled_keys={disabled_keys}; "
             f"visible_enabled_ref_fk={visible}"
         ) from exc
     return {
         "referencing_fk": disabled_ref_fk,
+        "own_fk": disabled_own_fk,
         "key_constraints": disabled_keys,
     }
 

@@ -843,10 +843,14 @@ def _prepare_target_for_direct_load(mid: str, m: dict, dst_cfg: dict, message_pa
                     conn, tgt_schema, tgt_table,
                 )
                 disabled_fk = truncate_result.get("referencing_fk") or []
+                disabled_own_fk = truncate_result.get("own_fk") or []
                 disabled_keys = truncate_result.get("key_constraints") or []
                 if disabled_fk:
                     message_parts.append(f"referencing FKs disabled={len(disabled_fk)}")
                     print(f"[orchestrator] {mid}: disabled referencing FKs: {disabled_fk}")
+                if disabled_own_fk:
+                    message_parts.append(f"own FKs disabled={len(disabled_own_fk)}")
+                    print(f"[orchestrator] {mid}: disabled own FKs: {disabled_own_fk}")
                 if disabled_keys:
                     message_parts.append(f"key constraints disabled={len(disabled_keys)}")
                     print(f"[orchestrator] {mid}: disabled key constraints CASCADE: {disabled_keys}")
@@ -1147,9 +1151,12 @@ def _handle_baseline_publishing(mid: str, m: dict) -> None:
                     conn, tgt_schema, tgt_table,
                 )
                 disabled_fk = truncate_result.get("referencing_fk") or []
+                disabled_own_fk = truncate_result.get("own_fk") or []
                 disabled_keys = truncate_result.get("key_constraints") or []
                 if disabled_fk:
                     print(f"[baseline_publishing] disabled referencing FKs: {disabled_fk}")
+                if disabled_own_fk:
+                    print(f"[baseline_publishing] disabled own FKs: {disabled_own_fk}")
                 if disabled_keys:
                     print(f"[baseline_publishing] disabled key constraints CASCADE: {disabled_keys}")
                 print(f"[baseline_publishing] truncated {tgt_quoted}")

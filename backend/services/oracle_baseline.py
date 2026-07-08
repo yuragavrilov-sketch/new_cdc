@@ -46,9 +46,12 @@ def publish_baseline(
             conn, target_schema, target_table,
         )
         disabled_fk = truncate_result.get("referencing_fk") or []
+        disabled_own_fk = truncate_result.get("own_fk") or []
         disabled_keys = truncate_result.get("key_constraints") or []
         if disabled_fk:
             print(f"[baseline] disabled referencing FKs: {disabled_fk}")
+        if disabled_own_fk:
+            print(f"[baseline] disabled own FKs: {disabled_own_fk}")
         if disabled_keys:
             print(f"[baseline] disabled key constraints CASCADE: {disabled_keys}")
         print(f"[baseline] truncated {tgt}")

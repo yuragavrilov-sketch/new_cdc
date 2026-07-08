@@ -75,13 +75,22 @@ class TruncateCursorStub:
 
     def execute(self, sql: str, params=None, **_kwargs):
         self.sql = sql
+        self.params = params or {}
         self.conn.executed.append((sql, params))
 
     def fetchall(self):
         if "FROM   all_constraints fk" in self.sql:
-            return [("TGT", "CHILD", "FK_CHILD_PARENT", "ENABLED")]
+            if self.params.get("t") == "PARENT":
+                return [("TGT", "CHILD", "FK_CHILD_PARENT", "ENABLED")]
+            return []
+        if "constraint_type = 'R'" in self.sql:
+            if self.params.get("t") == "CHILD":
+                return [("CHILD_PARENT_FK",)]
+            return []
         if "constraint_type IN ('P', 'U')" in self.sql:
-            return [("PARENT_PK", "P")]
+            if self.params.get("t") == "PARENT":
+                return [("PARENT_PK", "P")]
+            return [("CHILD_PK", "P")]
         return []
 
 
@@ -241,9 +250,24 @@ def test_truncate_table_for_load_disables_child_fk_and_parent_key_cascade():
     )
     assert result == {
         "referencing_fk": ["TGT.CHILD.FK_CHILD_PARENT"],
+        "own_fk": [],
         "key_constraints": ["P:PARENT_PK"],
     }
     assert conn.commits >= 3
+
+
+def test_truncate_table_for_load_disables_own_fk_before_truncate():
+    conn = TruncateConnStub()
+
+    result = oracle_browser.truncate_table_for_load(conn, "TGT", "CHILD")
+
+    sqls = [sql for sql, _params in conn.executed]
+    own_fk_sql = 'ALTER TABLE "TGT"."CHILD" DISABLE CONSTRAINT "CHILD_PARENT_FK"'
+    truncate_sql = 'TRUNCATE TABLE "TGT"."CHILD"'
+    assert own_fk_sql in sqls
+    assert truncate_sql in sqls
+    assert sqls.index(own_fk_sql) < sqls.index(truncate_sql)
+    assert result["own_fk"] == ["TGT.CHILD.CHILD_PARENT_FK"]
 
 
 class ReconcileCursorStub:
