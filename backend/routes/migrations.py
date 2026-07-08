@@ -47,7 +47,7 @@ _LIST_COLS = """
     error_code, error_text, failed_phase, retry_count,
     description, created_by,
     total_rows, total_chunks, chunks_done, chunks_failed, rows_loaded,
-    strategy, truncate_target, group_id
+    strategy, truncate_target, group_id, paused, paused_at
 """
 
 _state: dict = {}
@@ -766,8 +766,6 @@ def delete_migration(migration_id: str):
 
 _ACTION_TRANSITIONS = {
     "run":            ("DRAFT",           "NEW"),
-    "pause":          (None,              "PAUSED"),
-    "resume":         ("PAUSED",          "BULK_LOADING"),   # sensible default; orchestrator re-routes
     "cancel":         (None,              "CANCELLING"),
     "lag_zero":       ("CDC_CATCHING_UP", "CDC_CAUGHT_UP"),   # called by the universal worker
     "retry_verify":   ("DATA_MISMATCH",   "DATA_VERIFYING"),
@@ -777,12 +775,19 @@ _ACTION_TRANSITIONS = {
 _ACTIVE_PHASES = {
     "NEW", "PREPARING", "SCN_FIXED",
     "CONNECTOR_STARTING", "CDC_BUFFERING",
+    "TOPIC_CREATING",
     "CHUNKING", "BULK_LOADING", "BULK_LOADED",
     "STAGE_VALIDATING", "STAGE_VALIDATED",
-    "BASELINE_PUBLISHING", "BASELINE_PUBLISHED",
+    "BASELINE_PUBLISHING", "BASELINE_LOADING", "BASELINE_PUBLISHED",
+    "STAGE_DROPPING", "INDEXES_ENABLING",
     "DATA_VERIFYING", "DATA_MISMATCH",
-    "CDC_APPLY_STARTING", "CDC_CATCHING_UP", "CDC_CAUGHT_UP",
+    "CDC_APPLY_STARTING", "CDC_APPLYING", "CDC_CATCHING_UP", "CDC_CAUGHT_UP",
     "STEADY_STATE",
+}
+
+_CDC_WORKER_PHASES = {
+    "CDC_APPLY_STARTING", "CDC_APPLYING", "CDC_CATCHING_UP",
+    "CDC_CAUGHT_UP", "STEADY_STATE",
 }
 
 
@@ -794,11 +799,11 @@ def migration_action(migration_id: str):
     body   = request.get_json(force=True) or {}
     action = body.get("action", "").strip().lower()
 
-    if action not in _ACTION_TRANSITIONS:
+    if action not in _ACTION_TRANSITIONS and action not in {"pause", "resume"}:
         return jsonify({"error": f"Unknown action: {action}. "
-                                 f"Valid: {list(_ACTION_TRANSITIONS)}"}), 400
+                                 f"Valid: {list(_ACTION_TRANSITIONS) + ['pause', 'resume']}"}), 400
 
-    required_from, to_phase = _ACTION_TRANSITIONS[action]
+    required_from, to_phase = _ACTION_TRANSITIONS.get(action, (None, None))
 
     try:
         conn = _state["get_conn"]()
@@ -812,6 +817,65 @@ def migration_action(migration_id: str):
                 if not row:
                     return jsonify({"error": "Not found"}), 404
                 current_phase = row[0]
+
+            if action in {"pause", "resume"}:
+                if action == "pause" and current_phase not in _ACTIVE_PHASES:
+                    return jsonify({
+                        "error": f"Action 'pause' requires active phase, "
+                                 f"current phase is '{current_phase}'"
+                    }), 409
+
+                now = datetime.utcnow()
+                paused = action == "pause"
+                final_phase = current_phase
+                with conn.cursor() as cur:
+                    if action == "resume" and current_phase == "PAUSED":
+                        # Legacy compatibility for rows paused by the previous
+                        # phase-based implementation. The original phase was not
+                        # persisted, so keep the old fallback behavior.
+                        final_phase = "BULK_LOADING"
+                        cur.execute(
+                            "UPDATE migrations SET phase = %s, paused = FALSE, paused_at = NULL, "
+                            "state_changed_at = %s, updated_at = %s WHERE migration_id = %s",
+                            (final_phase, now, now, migration_id),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE migrations SET paused = %s, paused_at = %s, updated_at = %s "
+                            "WHERE migration_id = %s",
+                            (paused, now if paused else None, now, migration_id),
+                        )
+                    if paused and current_phase in _CDC_WORKER_PHASES:
+                        cur.execute("""
+                            UPDATE migration_cdc_state
+                            SET    worker_id        = NULL,
+                                   worker_heartbeat = NULL,
+                                   updated_at       = NOW()
+                            WHERE  migration_id = %s
+                        """, (migration_id,))
+                    cur.execute("""
+                        INSERT INTO migration_state_history
+                            (migration_id, from_phase, to_phase, message, actor_type, actor_id)
+                        VALUES (%s, %s, %s, %s, 'USER', %s)
+                    """, (migration_id, current_phase, final_phase,
+                          body.get("message", f"Action: {action}"),
+                          body.get("actor_id")))
+                conn.commit()
+                event = {
+                    "type":         "migration_phase",
+                    "migration_id": migration_id,
+                    "from_phase":   current_phase,
+                    "phase":        final_phase,
+                    "paused":       paused,
+                    "ts":           now.isoformat() + "Z",
+                }
+                _state["broadcast"](event)
+                return jsonify({
+                    "ok": True,
+                    "from_phase": current_phase,
+                    "to_phase": final_phase,
+                    "paused": paused,
+                })
 
             if required_from and current_phase != required_from:
                 return jsonify({

@@ -64,6 +64,8 @@ export interface Migration {
   error_text: string | null;
   failed_phase: string | null;
   retry_count: number;
+  paused: boolean;
+  paused_at: string | null;
   // ── Progress / monitoring (added stage 1) ────────────────────────────────
   total_rows: number | null;
   total_chunks: number | null;
@@ -122,6 +124,8 @@ export interface MigrationSummary {
   error_text: string | null;
   failed_phase: string | null;
   retry_count: number;
+  paused: boolean;
+  paused_at: string | null;
   description: string | null;
   created_by: string | null;
   total_rows: number | null;

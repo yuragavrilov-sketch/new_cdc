@@ -179,6 +179,7 @@ def claim_chunk(conn) -> Optional[dict]:
                 FROM   migration_chunks c
                 JOIN   migrations m ON m.migration_id = c.migration_id
                 WHERE  c.status = 'PENDING'
+                  AND  COALESCE(m.paused, FALSE) = FALSE
                   AND  (
                       (COALESCE(c.chunk_type, 'BULK') = 'BULK'     AND m.phase = 'BULK_LOADING')
                    OR (c.chunk_type = 'BASELINE' AND m.phase = 'BASELINE_LOADING')
@@ -431,6 +432,7 @@ def claim_cdc_migration(conn, exclude_migration_ids: Optional[list[str]] = None)
             FROM   migrations m
             LEFT JOIN migration_cdc_state cs ON cs.migration_id = m.migration_id
             WHERE  m.phase IN ('CDC_APPLY_STARTING', 'CDC_APPLYING', 'CDC_CATCHING_UP', 'STEADY_STATE')
+              AND  COALESCE(m.paused, FALSE) = FALSE
               AND  (
                      cs.worker_heartbeat IS NULL
                   OR cs.worker_heartbeat < NOW() - make_interval(mins => %s)
@@ -477,6 +479,41 @@ def claim_cdc_migration(conn, exclude_migration_ids: Optional[list[str]] = None)
 
     conn.commit()
     return migration
+
+
+def cdc_migration_should_run(conn, migration_id: str) -> bool:
+    """Return False when a CDC thread should stop at a safe boundary."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT phase, paused
+            FROM   migrations
+            WHERE  migration_id = %s
+        """, (migration_id,))
+        row = cur.fetchone()
+    if not row:
+        return False
+    phase, paused = row
+    return (
+        not bool(paused)
+        and phase in (
+            "CDC_APPLY_STARTING", "CDC_APPLYING", "CDC_CATCHING_UP",
+            "CDC_CAUGHT_UP", "STEADY_STATE",
+        )
+    )
+
+
+def release_cdc_migration(conn, migration_id: str) -> None:
+    """Release this worker's CDC heartbeat so the migration can be reclaimed."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE migration_cdc_state
+            SET    worker_id        = NULL,
+                   worker_heartbeat = NULL,
+                   updated_at       = NOW()
+            WHERE  migration_id = %s
+              AND  worker_id = %s
+        """, (migration_id, WORKER_ID))
+    conn.commit()
 
 
 def cdc_checkin(conn, migration_id: str, total_lag: int,
@@ -571,8 +608,10 @@ def claim_compare_chunk(conn) -> Optional[dict]:
                 SELECT c.chunk_id
                 FROM   data_compare_chunks c
                 JOIN   data_compare_tasks  t ON t.task_id = c.task_id
+                LEFT JOIN migrations m ON m.data_compare_task_id = t.task_id
                 WHERE  c.status = 'PENDING'
                   AND  t.status = 'RUNNING'
+                  AND  COALESCE(m.paused, FALSE) = FALSE
                 ORDER BY c.created_at, c.chunk_seq
                 FOR UPDATE OF c SKIP LOCKED
                 LIMIT 1
@@ -776,11 +815,13 @@ def claim_target_index_job(conn) -> Optional[dict]:
     with conn.cursor() as cur:
         cur.execute("""
             WITH candidate AS (
-                SELECT job_id
-                FROM   target_index_jobs
-                WHERE  state = 'PENDING'
-                ORDER BY created_at
-                FOR UPDATE SKIP LOCKED
+                SELECT j.job_id
+                FROM   target_index_jobs j
+                JOIN   migrations m ON m.migration_id = j.migration_id
+                WHERE  j.state = 'PENDING'
+                  AND  COALESCE(m.paused, FALSE) = FALSE
+                ORDER BY j.created_at
+                FOR UPDATE OF j SKIP LOCKED
                 LIMIT 1
             )
             UPDATE target_index_jobs

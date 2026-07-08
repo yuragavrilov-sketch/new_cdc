@@ -83,6 +83,45 @@ class FullRestartConnStub:
         self.calls.append(("CLOSE", None))
 
 
+class MigrationActionCursorStub:
+    def __init__(self, calls, *, phase="CDC_CATCHING_UP"):
+        self.calls = calls
+        self.phase = phase
+        self._next_fetchone = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=None):
+        compact_sql = " ".join(sql.split())
+        self.calls.append((compact_sql, params))
+        if "SELECT phase FROM migrations" in compact_sql:
+            self._next_fetchone = (self.phase,)
+        else:
+            self._next_fetchone = None
+
+    def fetchone(self):
+        return self._next_fetchone
+
+
+class MigrationActionConnStub:
+    def __init__(self, calls, *, phase="CDC_CATCHING_UP"):
+        self.calls = calls
+        self.phase = phase
+
+    def cursor(self):
+        return MigrationActionCursorStub(self.calls, phase=self.phase)
+
+    def commit(self):
+        self.calls.append(("COMMIT", None))
+
+    def close(self):
+        self.calls.append(("CLOSE", None))
+
+
 def test_legacy_direct_cdc_creation_error_points_to_schema_screen():
     message = migrations._legacy_cdc_creation_error()
 
@@ -204,6 +243,59 @@ def test_cancel_group_managed_cdc_migration_keeps_shared_connector(monkeypatch):
     assert res.get_json()["to_phase"] == "CANCELLING"
     assert deleted_connectors == []
     assert broadcasts[-1]["phase"] == "CANCELLING"
+
+
+def test_pause_keeps_current_phase_and_sets_paused(monkeypatch):
+    app = Flask(__name__)
+    app.register_blueprint(migrations.bp)
+    calls = []
+    broadcasts = []
+
+    monkeypatch.setitem(migrations._state, "db_available", {"value": True})
+    monkeypatch.setitem(
+        migrations._state,
+        "get_conn",
+        lambda: MigrationActionConnStub(calls, phase="CDC_CATCHING_UP"),
+    )
+    monkeypatch.setitem(migrations._state, "broadcast", lambda event: broadcasts.append(event))
+
+    res = app.test_client().post("/api/migrations/mid-1/action", json={"action": "pause"})
+
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["to_phase"] == "CDC_CATCHING_UP"
+    assert body["paused"] is True
+    assert broadcasts[-1]["phase"] == "CDC_CATCHING_UP"
+    assert broadcasts[-1]["paused"] is True
+    assert any("UPDATE migrations SET paused = %s" in sql for sql, _params in calls)
+    assert any("UPDATE migration_cdc_state SET worker_id = NULL" in sql for sql, _params in calls)
+    assert not any("UPDATE migrations SET phase=%s" in sql for sql, _params in calls)
+
+
+def test_resume_keeps_current_phase_and_clears_paused(monkeypatch):
+    app = Flask(__name__)
+    app.register_blueprint(migrations.bp)
+    calls = []
+    broadcasts = []
+
+    monkeypatch.setitem(migrations._state, "db_available", {"value": True})
+    monkeypatch.setitem(
+        migrations._state,
+        "get_conn",
+        lambda: MigrationActionConnStub(calls, phase="BULK_LOADING"),
+    )
+    monkeypatch.setitem(migrations._state, "broadcast", lambda event: broadcasts.append(event))
+
+    res = app.test_client().post("/api/migrations/mid-1/action", json={"action": "resume"})
+
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["to_phase"] == "BULK_LOADING"
+    assert body["paused"] is False
+    assert broadcasts[-1]["phase"] == "BULK_LOADING"
+    assert broadcasts[-1]["paused"] is False
+    assert any("UPDATE migrations SET paused = %s" in sql for sql, _params in calls)
+    assert not any("UPDATE migrations SET phase=%s" in sql for sql, _params in calls)
 
 
 def test_full_restart_resets_migration_to_draft(monkeypatch):

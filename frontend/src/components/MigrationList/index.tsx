@@ -7,7 +7,13 @@ import { EmptyState } from "../ui";
 import { ACTIVE_PHASES } from "../MigrationDetail/helpers";
 import { t } from "../../theme";
 import type { FilterKey, SpeedSnapshot } from "./helpers";
-import { FILTER_LABELS, DONE_PHASES } from "./helpers";
+import {
+  FILTER_LABELS,
+  DONE_PHASES,
+  migrationRowActions,
+  phaseFilterOptions,
+  type MigrationRowAction,
+} from "./helpers";
 import { MigrationRow } from "./MigrationRow";
 
 interface Props {
@@ -24,6 +30,7 @@ export function MigrationList({ refreshSignal, sseEvents, onOpenMigration }: Pro
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [speeds,     setSpeeds]     = useState<Record<string, { chunksSec: number; rowsSec: number }>>({});
   const [filter,     setFilter]     = useState<FilterKey>("all");
+  const [phaseFilter, setPhaseFilter] = useState("all");
   const [search,     setSearch]     = useState("");
   const [bulkIds,    setBulkIds]    = useState<Set<string>>(() => new Set());
   const [bulkBusy,   setBulkBusy]   = useState(false);
@@ -73,10 +80,13 @@ export function MigrationList({ refreshSignal, sseEvents, onOpenMigration }: Pro
 
   const visible = migrations.filter(m => {
     if (filter === "active") return ACTIVE_PHASES.has(m.phase);
+    if (filter === "paused") return !!m.paused;
     if (filter === "done")   return DONE_PHASES.has(m.phase);
     if (filter === "error")  return m.phase === "FAILED" || !!m.error_code;
     if (filter === "draft")  return m.phase === "DRAFT";
     return true;
+  }).filter(m => {
+    return phaseFilter === "all" || m.phase === phaseFilter;
   }).filter(m => {
     if (!search.trim()) return true;
     const q = search.toLowerCase();
@@ -88,17 +98,28 @@ export function MigrationList({ refreshSignal, sseEvents, onOpenMigration }: Pro
   });
 
   const selected = migrations.find(m => m.migration_id === selectedId) ?? null;
+  const selectedMigrations = migrations.filter(m => bulkIds.has(m.migration_id));
+  const selectedPauseIds = selectedMigrations
+    .filter(m => migrationRowActions(m.phase, m.paused).canPause)
+    .map(m => m.migration_id);
+  const selectedResumeIds = selectedMigrations
+    .filter(m => migrationRowActions(m.phase, m.paused).canResume)
+    .map(m => m.migration_id);
+  const phaseOptions = phaseFilterOptions(migrations);
 
-  const handleAction = useCallback(async (id: string, action: "run" | "stop" | "delete") => {
+  const handleAction = useCallback(async (id: string, action: MigrationRowAction) => {
     if (action === "delete") {
       if (!window.confirm("Удалить миграцию? Это действие необратимо.")) return;
     }
+    if (action === "stop") {
+      if (!window.confirm("Остановить миграцию? Это действие переведёт её в отмену.")) return;
+    }
     setActionBusy(id);
     try {
-      if (action === "run") {
+      if (action === "run" || action === "pause" || action === "resume") {
         await fetch(`/api/migrations/${id}/action`, {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "run" }),
+          body: JSON.stringify({ action }),
         });
       } else if (action === "stop") {
         await fetch(`/api/migrations/${id}/action`, {
@@ -128,7 +149,11 @@ export function MigrationList({ refreshSignal, sseEvents, onOpenMigration }: Pro
 
   // Параллельный fetch с лимитом — чтобы при сотнях миграций браузер
   // не отстреливал «too many requests».
-  async function _runBulk(ids: string[], call: (id: string) => Promise<Response>) {
+  async function _runBulk(
+    ids: string[],
+    call: (id: string) => Promise<Response>,
+    clearSelection = true,
+  ) {
     setBulkBusy(true);
     const failed: string[] = [];
     try {
@@ -148,7 +173,7 @@ export function MigrationList({ refreshSignal, sseEvents, onOpenMigration }: Pro
       await Promise.all(workers);
     } finally {
       setBulkBusy(false);
-      clearBulk();
+      if (clearSelection) clearBulk();
       load();
     }
     if (failed.length > 0) {
@@ -166,6 +191,25 @@ export function MigrationList({ refreshSignal, sseEvents, onOpenMigration }: Pro
       body:    JSON.stringify({ action: "cancel" }),
     }));
   }, [bulkIds, clearBulk, load]);
+
+  const bulkPause = useCallback(async () => {
+    if (selectedPauseIds.length === 0) return;
+    if (!confirm(`Поставить на паузу ${selectedPauseIds.length} миграций? Уже взятые операции завершатся, новые браться не будут.`)) return;
+    await _runBulk(selectedPauseIds, id => fetch(`/api/migrations/${id}/action`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ action: "pause" }),
+    }), false);
+  }, [selectedPauseIds, clearBulk, load]);
+
+  const bulkResume = useCallback(async () => {
+    if (selectedResumeIds.length === 0) return;
+    await _runBulk(selectedResumeIds, id => fetch(`/api/migrations/${id}/action`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ action: "resume" }),
+    }));
+  }, [selectedResumeIds, clearBulk, load]);
 
   const bulkDelete = useCallback(async () => {
     const ids = Array.from(bulkIds);
@@ -261,6 +305,7 @@ export function MigrationList({ refreshSignal, sseEvents, onOpenMigration }: Pro
               {FILTER_LABELS.map(({ key, label }) => {
                 const count = key === "all" ? migrations.length
                   : key === "active" ? migrations.filter(m => ACTIVE_PHASES.has(m.phase)).length
+                  : key === "paused" ? migrations.filter(m => !!m.paused).length
                   : key === "done"   ? migrations.filter(m => DONE_PHASES.has(m.phase)).length
                   : key === "error"  ? migrations.filter(m => m.phase === "FAILED" || !!m.error_code).length
                   : migrations.filter(m => m.phase === "DRAFT").length;
@@ -278,6 +323,21 @@ export function MigrationList({ refreshSignal, sseEvents, onOpenMigration }: Pro
                   </button>
                 );
               })}
+              <select
+                value={phaseFilter}
+                onChange={e => setPhaseFilter(e.target.value)}
+                title="Фильтр по фазе"
+                style={{
+                  background: t.bg.s2, border: `1px solid ${t.border.base}`,
+                  borderRadius: t.radius.md, color: t.text.secondary,
+                  padding: "3px 8px", fontSize: t.size.sm, maxWidth: 190, outline: "none",
+                }}
+              >
+                <option value="all">Все фазы</option>
+                {phaseOptions.map(({ phase, count }) => (
+                  <option key={phase} value={phase}>{phase} ({count})</option>
+                ))}
+              </select>
               <input
                 value={search}
                 onChange={e => setSearch(e.target.value)}
@@ -310,6 +370,20 @@ export function MigrationList({ refreshSignal, sseEvents, onOpenMigration }: Pro
                 fontSize: t.size.xs, padding: "2px 8px", cursor: "pointer",
               }}>Сбросить</button>
               <span style={{ flex: 1 }}/>
+              {selectedPauseIds.length > 0 && (
+                <button onClick={bulkPause} disabled={bulkBusy} style={{
+                  background: t.amber.bg, border: `1px solid ${t.amber.dim}`,
+                  borderRadius: t.radius.sm, color: t.amber.fg,
+                  fontSize: t.size.xs, padding: "3px 10px", cursor: "pointer", fontWeight: 700,
+                }}>Ⅱ Пауза {selectedPauseIds.length}</button>
+              )}
+              {selectedResumeIds.length > 0 && (
+                <button onClick={bulkResume} disabled={bulkBusy} style={{
+                  background: t.green.bg, border: `1px solid ${t.green.dim}`,
+                  borderRadius: t.radius.sm, color: t.green.fg,
+                  fontSize: t.size.xs, padding: "3px 10px", cursor: "pointer", fontWeight: 700,
+                }}>▶ Продолжить {selectedResumeIds.length}</button>
+              )}
               <button onClick={bulkStop} disabled={bulkBusy} style={{
                 background: t.red.bg, border: `1px solid ${t.red.dim}`,
                 borderRadius: t.radius.sm, color: t.red.fg,

@@ -204,6 +204,8 @@ def _init_schema_legacy() -> None:
                     error_code                varchar(64)  NULL,
                     error_text                text         NULL,
                     failed_phase              varchar(32)  NULL,
+                    paused                    boolean      NOT NULL DEFAULT false,
+                    paused_at                 timestamp    NULL,
                     retry_count               int          NOT NULL DEFAULT 0
                 )
             """)
@@ -261,6 +263,8 @@ def _init_schema_legacy() -> None:
                 "ALTER TABLE migrations ADD COLUMN IF NOT EXISTS queue_position            INTEGER",
                 "ALTER TABLE migrations ADD COLUMN IF NOT EXISTS data_compare_task_id      UUID",
                 "ALTER TABLE migrations ADD COLUMN IF NOT EXISTS truncate_target           BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE migrations ADD COLUMN IF NOT EXISTS paused                    BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE migrations ADD COLUMN IF NOT EXISTS paused_at                 TIMESTAMP",
             ]:
                 cur.execute(col_sql)
                 col_name = col_sql.split("IF NOT EXISTS")[1].strip().split()[0]
@@ -885,7 +889,11 @@ def get_active_migrations(conn) -> list[dict]:
     placeholders = ",".join(["%s"] * len(_ACTIVE_PHASES))
     with conn.cursor() as cur:
         cur.execute(
-            f"SELECT * FROM migrations WHERE phase IN ({placeholders})",
+            f"""
+            SELECT * FROM migrations
+            WHERE phase IN ({placeholders})
+              AND COALESCE(paused, FALSE) = FALSE
+            """,
             _ACTIVE_PHASES,
         )
         return [row_to_dict(cur, r) for r in cur.fetchall()]

@@ -194,6 +194,42 @@ def test_claim_cdc_migration_excludes_active_ids_without_heartbeat_refresh(monke
     )
 
 
+def test_claim_chunk_skips_paused_migrations(monkeypatch):
+    conn = ConnStub(row=None)
+
+    chunk = worker_common.claim_chunk(conn)
+
+    assert chunk is None
+    select_sql, _params = conn.cur.executed[0]
+    assert "COALESCE(m.paused, FALSE) = FALSE" in select_sql
+
+
+def test_claim_cdc_migration_skips_paused_migrations(monkeypatch):
+    conn = ConnStub(row=None)
+
+    migration = worker_common.claim_cdc_migration(conn)
+
+    assert migration is None
+    select_sql, _params = conn.cur.executed[0]
+    assert "COALESCE(m.paused, FALSE) = FALSE" in select_sql
+
+
+def test_cdc_migration_should_run_false_when_paused():
+    conn = ConnStub(row=("CDC_CATCHING_UP", True))
+
+    assert worker_common.cdc_migration_should_run(conn, "mid-1") is False
+
+    sql, params = conn.cur.executed[0]
+    assert "SELECT phase, paused" in sql
+    assert params == ("mid-1",)
+
+
+def test_cdc_migration_should_run_true_when_active_and_unpaused():
+    conn = ConnStub(row=("STEADY_STATE", False))
+
+    assert worker_common.cdc_migration_should_run(conn, "mid-1") is True
+
+
 def test_cdc_checkin_recomputes_topic_from_migration_columns(monkeypatch):
     monkeypatch.setattr(worker_common, "WORKER_ID", "worker-1")
     conn = ConnStub()

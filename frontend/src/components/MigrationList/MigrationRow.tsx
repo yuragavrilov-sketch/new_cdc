@@ -2,11 +2,10 @@ import React from "react";
 import type { MigrationSummary } from "../../types/migration";
 import { hasCdc, strategyLabel } from "../../types/migration";
 import { PhaseBadge } from "../PhaseBadge";
-import { ACTIVE_PHASES, DELETABLE_PHASES } from "../MigrationDetail/helpers";
 import { t } from "../../theme";
 import { fmtTs, fmtSpeed } from "../../utils/format";
 import { ActionBtn } from "./ActionBtn";
-import { BULK_PHASES } from "./helpers";
+import { BULK_PHASES, migrationRowActions, type MigrationRowAction } from "./helpers";
 
 interface Props {
   m:        MigrationSummary;
@@ -15,7 +14,7 @@ interface Props {
   busy:     boolean;
   speed?:   { chunksSec: number; rowsSec: number };
   onClick:  () => void;
-  onAction: (id: string, action: "run" | "stop" | "delete") => void;
+  onAction: (id: string, action: MigrationRowAction) => void;
   /** Bulk-select state — независимо от выделения «строка раскрыта» */
   checked?:        boolean;
   onToggleCheck?:  (id: string) => void;
@@ -25,9 +24,7 @@ export function MigrationRow({
   m, selected, compact, busy, speed, onClick, onAction,
   checked, onToggleCheck,
 }: Props) {
-  const canRun    = m.phase === "DRAFT";
-  const canStop   = ACTIVE_PHASES.has(m.phase);
-  const canDelete = DELETABLE_PHASES.has(m.phase);
+  const { canRun, canPause, canResume, canStop, canDelete } = migrationRowActions(m.phase, m.paused);
 
   const showProgress = BULK_PHASES.has(m.phase) && m.total_chunks != null && m.total_chunks > 0;
   const pct = showProgress ? Math.min(100, (m.chunks_done / m.total_chunks!) * 100) : 0;
@@ -66,6 +63,15 @@ export function MigrationRow({
           {m.migration_name}
         </span>
         <PhaseBadge phase={m.phase} size="sm" />
+        {m.paused && (
+          <span style={{
+            background: t.amber.bg, color: t.amber.fg,
+            border: `1px solid ${t.amber.dim}`, borderRadius: t.radius.sm,
+            fontSize: t.size.xs, fontWeight: 700, padding: "1px 6px",
+          }}>
+            Пауза
+          </span>
+        )}
         {m.strategy && (
           <span style={{
             marginLeft: 8, padding: "2px 6px", borderRadius: 4,
@@ -94,6 +100,16 @@ export function MigrationRow({
             <ActionBtn icon="▶" title="Запустить" color={t.green.fg} bg={t.green.bg}
               disabled={busy}
               onClick={() => onAction(m.migration_id, "run")} />
+          )}
+          {canPause && (
+            <ActionBtn icon="Ⅱ" title="Пауза: не брать новые bulk chunks" color={t.amber.fg} bg={t.amber.bg}
+              disabled={busy}
+              onClick={() => onAction(m.migration_id, "pause")} />
+          )}
+          {canResume && (
+            <ActionBtn icon="▶" title="Продолжить" color={t.green.fg} bg={t.green.bg}
+              disabled={busy}
+              onClick={() => onAction(m.migration_id, "resume")} />
           )}
           {canStop && (
             <ActionBtn icon="⏹" title="Остановить" color={t.red.fg} bg={t.red.bg}

@@ -99,6 +99,19 @@ export function MigrationDetailPanel({ migrationId, onClose, sseEvents = [] }: P
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
           {detail && <PhaseBadge phase={detail.phase} />}
+          {detail?.paused && (
+            <span style={{
+              background: t.amber.bg,
+              color: t.amber.fg,
+              border: `1px solid ${t.amber.dim}`,
+              borderRadius: t.radius.sm,
+              fontSize: t.size.sm,
+              fontWeight: 700,
+              padding: "2px 8px",
+            }}>
+              Пауза
+            </span>
+          )}
           <span style={{ fontWeight: 700, fontSize: t.size.lg, color: t.text.primary, flex: 1 }}>
             {detail?.migration_name ?? "Загрузка..."}
           </span>
@@ -121,7 +134,13 @@ export function MigrationDetailPanel({ migrationId, onClose, sseEvents = [] }: P
               ))) && (
             <EnableTriggersButton migrationId={migrationId} onDone={loadDetail} />
           ))}
-          <StopDeleteButtons migrationId={migrationId} phase={phase} onDone={loadDetail} onDeleted={onClose} />
+          <StopDeleteButtons
+            migrationId={migrationId}
+            phase={phase}
+            paused={!!detail?.paused}
+            onDone={loadDetail}
+            onDeleted={onClose}
+          />
           <button onClick={onClose} style={{
             background: "none", border: "none", color: t.text.disabled,
             cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "0 4px",

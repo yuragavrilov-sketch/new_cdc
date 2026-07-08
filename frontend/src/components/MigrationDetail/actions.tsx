@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Button } from "../ui";
 import { t } from "../../theme";
 import { ACTIVE_PHASES, DELETABLE_PHASES } from "./helpers";
+import { migrationRowActions } from "../MigrationList/helpers";
 
 // ── WorkerCountEditor ────────────────────────────────────────────────────────
 
@@ -441,14 +442,38 @@ export function DataVerifyCard({ taskId, phase }: { taskId: string; phase: strin
 
 // ── StopDeleteButtons ────────────────────────────────────────────────────────
 
-export function StopDeleteButtons({ migrationId, phase, onDone, onDeleted }: {
-  migrationId: string; phase: string; onDone: () => void; onDeleted: () => void;
+export function StopDeleteButtons({ migrationId, phase, paused, onDone, onDeleted }: {
+  migrationId: string; phase: string; paused?: boolean; onDone: () => void; onDeleted: () => void;
 }) {
   const [busy, setBusy] = useState(false);
 
+  const { canPause, canResume } = migrationRowActions(phase, !!paused);
   const canStop   = ACTIVE_PHASES.has(phase);
   const canDelete = DELETABLE_PHASES.has(phase);
-  if (!canStop && !canDelete) return null;
+  if (!canPause && !canResume && !canStop && !canDelete) return null;
+
+  async function doPause() {
+    if (!confirm("Поставить миграцию на паузу? Уже взятая операция завершится, новые браться не будут.")) return;
+    setBusy(true);
+    try {
+      await fetch(`/api/migrations/${migrationId}/action`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "pause" }),
+      });
+      onDone();
+    } finally { setBusy(false); }
+  }
+
+  async function doResume() {
+    setBusy(true);
+    try {
+      await fetch(`/api/migrations/${migrationId}/action`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "resume" }),
+      });
+      onDone();
+    } finally { setBusy(false); }
+  }
 
   async function doStop() {
     if (!confirm("Остановить миграцию? Текущая операция завершится, после чего миграция перейдёт в CANCELLED.")) return;
@@ -473,6 +498,16 @@ export function StopDeleteButtons({ migrationId, phase, onDone, onDeleted }: {
 
   return (
     <div style={{ display: "flex", gap: 4 }}>
+      {canPause && (
+        <Button variant="secondary" size="sm" onClick={doPause} disabled={busy}>
+          Пауза
+        </Button>
+      )}
+      {canResume && (
+        <Button variant="success" size="sm" onClick={doResume} disabled={busy}>
+          Продолжить
+        </Button>
+      )}
       {canStop && (
         <Button variant="danger" size="sm" onClick={doStop} disabled={busy}>
           Остановить

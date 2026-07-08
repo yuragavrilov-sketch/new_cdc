@@ -1123,6 +1123,13 @@ def cdc_thread(migration: dict, stop_event: threading.Event) -> None:
     try:
         while not stop_event.is_set():
             try:
+                if not db.cdc_migration_should_run(pg, migration_id):
+                    print(f"[cdc:{tag}] stopping: migration paused or no longer active")
+                    return
+            except Exception as exc:
+                print(f"[cdc:{tag}] pause check error: {exc}")
+
+            try:
                 raw_msgs = consumer.poll(timeout_ms=CDC_POLL_MS)
             except Exception as exc:
                 consecutive_poll_errors += 1
@@ -1233,6 +1240,11 @@ def cdc_thread(migration: dict, stop_event: threading.Event) -> None:
             print(f"[cdc:{tag}] mark-FAILED error: {fail_exc}")
     finally:
         print(f"[cdc:{tag}] thread stopping")
+        try:
+            if pg is not None:
+                db.release_cdc_migration(pg, migration_id)
+        except Exception as exc:
+            print(f"[cdc:{tag}] release heartbeat error: {exc}")
         for obj in (oracle_conn, consumer):
             try:
                 obj.close()
