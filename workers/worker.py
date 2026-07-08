@@ -92,6 +92,9 @@ WORKER_HEARTBEAT_SEC = int(os.environ.get("WORKER_HEARTBEAT_SEC", 10))
 # Rebuild post-load indexes with PARALLEL (degree reset to NOPARALLEL after) —
 # large index rebuilds are much faster in parallel. Disable for tiny tables.
 INDEX_REBUILD_PARALLEL = os.environ.get("INDEX_REBUILD_PARALLEL", "true").lower() == "true"
+TARGET_INDEX_DDL_LOCK_TIMEOUT = max(0, int(os.environ.get("TARGET_INDEX_DDL_LOCK_TIMEOUT", 60)))
+TARGET_INDEX_DDL_RETRIES = max(1, int(os.environ.get("TARGET_INDEX_DDL_RETRIES", 3)))
+TARGET_INDEX_DDL_RETRY_SLEEP_SEC = max(0, int(os.environ.get("TARGET_INDEX_DDL_RETRY_SLEEP_SEC", 10)))
 
 # Sentinel Debezium emits for a LOB column that was NOT changed by an UPDATE
 # (only changed columns are mined for LOBs). Must match the connector's
@@ -322,6 +325,10 @@ def _oracle_connection_error_code(exc: Exception) -> str:
     if "not connected to database" in text.lower():
         return "DPY-1001"
     return "CONNECTION_LOST"
+
+
+def _is_ora00054(exc: Exception) -> bool:
+    return "ORA-00054" in str(exc)
 
 
 def _parse_ora00001_constraint(exc: Exception, default_owner: str) -> tuple[str | None, str | None]:
@@ -2115,6 +2122,23 @@ def _target_index_log(tag: str | None, message: str) -> None:
         print(f"[target_index] {tag} {message}", flush=True)
 
 
+def _target_index_execute_ddl(cur, sql: str, *, tag: str | None, stage: str) -> None:
+    for attempt in range(1, TARGET_INDEX_DDL_RETRIES + 1):
+        try:
+            cur.execute(sql)
+            return
+        except Exception as exc:
+            if not _is_ora00054(exc) or attempt >= TARGET_INDEX_DDL_RETRIES:
+                raise
+            _target_index_log(
+                tag,
+                f"stage={stage} ORA-00054 retry {attempt}/{TARGET_INDEX_DDL_RETRIES - 1} "
+                f"sleep={TARGET_INDEX_DDL_RETRY_SLEEP_SEC}s err={type(exc).__name__}: {exc}",
+            )
+            if TARGET_INDEX_DDL_RETRY_SLEEP_SEC:
+                time.sleep(TARGET_INDEX_DDL_RETRY_SLEEP_SEC)
+
+
 def _enable_target_indexes(
     conn,
     schema: str,
@@ -2158,9 +2182,22 @@ def _enable_target_indexes(
         deferred_fk: list[dict] = []
 
         with conn.cursor() as cur:
+            if TARGET_INDEX_DDL_LOCK_TIMEOUT > 0:
+                stage = "set-ddl-lock-timeout"
+                _target_index_log(
+                    tag,
+                    f"stage={stage} seconds={TARGET_INDEX_DDL_LOCK_TIMEOUT}",
+                )
+                cur.execute(f"ALTER SESSION SET DDL_LOCK_TIMEOUT = {TARGET_INDEX_DDL_LOCK_TIMEOUT}")
+
             stage = "alter-table-logging"
             _target_index_log(tag, f"stage={stage} sql=ALTER TABLE {s}.{t} LOGGING")
-            cur.execute(f'ALTER TABLE "{s}"."{t}" LOGGING')
+            _target_index_execute_ddl(
+                cur,
+                f'ALTER TABLE "{s}"."{t}" LOGGING',
+                tag=tag,
+                stage=stage,
+            )
 
             stage = "list-unusable-indexes"
             _target_index_log(tag, f"stage={stage}")
@@ -2181,13 +2218,23 @@ def _enable_target_indexes(
                         tag,
                         f"stage={stage} sql=ALTER INDEX {s}.{index_name} {rebuild_clause}",
                     )
-                    cur.execute(f'ALTER INDEX "{s}"."{index_name}" {rebuild_clause}')
+                    _target_index_execute_ddl(
+                        cur,
+                        f'ALTER INDEX "{s}"."{index_name}" {rebuild_clause}',
+                        tag=tag,
+                        stage=stage,
+                    )
                     if parallel_rebuild:
                         # Reset the degree so later DML/queries don't silently go
                         # parallel just because we rebuilt with PARALLEL.
                         try:
                             _target_index_log(tag, f"stage=noparallel-reset index={index_name}")
-                            cur.execute(f'ALTER INDEX "{s}"."{index_name}" NOPARALLEL')
+                            _target_index_execute_ddl(
+                                cur,
+                                f'ALTER INDEX "{s}"."{index_name}" NOPARALLEL',
+                                tag=tag,
+                                stage="noparallel-reset",
+                            )
                         except Exception as np_exc:
                             print(
                                 f"[target_index] {s}.{index_name} NOPARALLEL reset failed: {np_exc}",
@@ -2225,8 +2272,11 @@ def _enable_target_indexes(
                             tag,
                             f"stage={stage} type=R mode=NOVALIDATE",
                         )
-                        cur.execute(
-                            f'ALTER TABLE "{s}"."{t}" ENABLE NOVALIDATE CONSTRAINT "{constraint_name}"'
+                        _target_index_execute_ddl(
+                            cur,
+                            f'ALTER TABLE "{s}"."{t}" ENABLE NOVALIDATE CONSTRAINT "{constraint_name}"',
+                            tag=tag,
+                            stage=stage,
                         )
                         enabled["fk_novalidate"].append(constraint_name)
                     else:
@@ -2234,8 +2284,11 @@ def _enable_target_indexes(
                             tag,
                             f"stage={stage} type={constraint_type} mode=VALIDATE",
                         )
-                        cur.execute(
-                            f'ALTER TABLE "{s}"."{t}" ENABLE CONSTRAINT "{constraint_name}"'
+                        _target_index_execute_ddl(
+                            cur,
+                            f'ALTER TABLE "{s}"."{t}" ENABLE CONSTRAINT "{constraint_name}"',
+                            tag=tag,
+                            stage=stage,
                         )
                         enabled["constraints"].append(constraint_name)
                 except Exception as exc:
@@ -2261,8 +2314,11 @@ def _enable_target_indexes(
                 stage = f"enable-referencing-fk {display_name}"
                 try:
                     _target_index_log(tag, f"stage={stage} mode=NOVALIDATE")
-                    cur.execute(
-                        f'ALTER TABLE "{owner}"."{child_table}" ENABLE NOVALIDATE CONSTRAINT "{constraint_name}"'
+                    _target_index_execute_ddl(
+                        cur,
+                        f'ALTER TABLE "{owner}"."{child_table}" ENABLE NOVALIDATE CONSTRAINT "{constraint_name}"',
+                        tag=tag,
+                        stage=stage,
                     )
                     enabled["referencing_fk_novalidate"].append(display_name)
                 except Exception as exc:

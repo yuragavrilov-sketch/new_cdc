@@ -183,6 +183,66 @@ def test_enable_target_indexes_serial_rebuild_when_disabled(monkeypatch):
     assert not any("NOPARALLEL" in s for s in sqls)
 
 
+def test_enable_target_indexes_retries_rebuild_on_ora00054(monkeypatch, capsys):
+    class BusyCursor:
+        def __init__(self, conn):
+            self.conn = conn
+            self.sql = ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, sql, params=None):
+            self.sql = sql
+            self.conn.executed.append((sql, params))
+            if sql == 'ALTER INDEX "TGT"."IDX1" REBUILD NOLOGGING':
+                self.conn.rebuild_attempts += 1
+                if self.conn.rebuild_attempts == 1:
+                    raise RuntimeError("ORA-00054: resource busy and acquire with NOWAIT specified or timeout expired")
+
+        def fetchone(self):
+            if "FROM   all_tables" in self.sql:
+                return ("N",)
+            return None
+
+        def fetchall(self):
+            if "FROM   all_indexes" in self.sql:
+                return [("IDX1",)]
+            if "constraint_type IN ('P','U','R','C')" in self.sql:
+                return []
+            if "FROM   all_constraints fk" in self.sql:
+                return []
+            return []
+
+    class BusyConn:
+        def __init__(self):
+            self.executed = []
+            self.rebuild_attempts = 0
+            self.committed = False
+
+        def cursor(self):
+            return BusyCursor(self)
+
+        def commit(self):
+            self.committed = True
+
+    conn = BusyConn()
+    monkeypatch.setattr(worker, "INDEX_REBUILD_PARALLEL", False)
+    monkeypatch.setattr(worker, "TARGET_INDEX_DDL_RETRY_SLEEP_SEC", 0)
+
+    result = worker._enable_target_indexes(conn, "TGT", "T", tag="TGT.T/job-busy")
+
+    out = capsys.readouterr().out
+    assert "ORA-00054 retry 1/" in out
+    assert conn.rebuild_attempts == 2
+    assert result["enabled"]["indexes"] == ["IDX1"]
+    assert result["errors"] == {"indexes": [], "constraints": []}
+    assert conn.committed is True
+
+
 def test_enable_target_indexes_pk_failure_is_fatal():
     conn = _FlexConn(
         own_constraints=[("PK_SELF", "P")],
