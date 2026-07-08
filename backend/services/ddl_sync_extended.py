@@ -23,6 +23,22 @@ def _drop_ignore_missing(tgt_conn, ddl: str) -> None:
         pass
 
 
+def _supported_index_type(index_type: str) -> bool:
+    return index_type.startswith("NORMAL") or index_type == "FUNCTION-BASED NORMAL"
+
+
+def _index_column_sql(columns: list[dict]) -> str:
+    parts = []
+    for col in columns:
+        term = (col.get("expression") or "").strip()
+        if not term:
+            term = f'"{col["name"]}"'
+        if col.get("descending"):
+            term = f"{term} DESC"
+        parts.append(term)
+    return ", ".join(parts)
+
+
 def sync_view(src_conn, tgt_conn, source_schema: str, target_schema: str, name: str) -> dict:
     """CREATE OR REPLACE VIEW on target from source definition."""
     info = get_view_info(src_conn, source_schema, name)
@@ -143,7 +159,7 @@ def sync_index(src_conn, tgt_conn, source_schema: str, target_schema: str, name:
     if not info:
         return {"error": f"Index {name} not found on source"}
     index_type = str(info.get("index_type") or "").upper()
-    if not index_type.startswith("NORMAL"):
+    if not _supported_index_type(index_type):
         return {"error": f"Index {name} type {index_type or 'UNKNOWN'} is not supported by DDL job"}
     columns = info.get("columns") or []
     if not columns:
@@ -152,10 +168,7 @@ def sync_index(src_conn, tgt_conn, source_schema: str, target_schema: str, name:
         _drop_ignore_missing(tgt_conn, f'DROP INDEX "{target_schema}"."{name}"')
     unique_kw = "UNIQUE " if info.get("uniqueness") == "UNIQUE" else ""
     reverse_kw = " REVERSE" if index_type == "NORMAL/REV" else ""
-    col_sql = ", ".join(
-        f'"{col["name"]}" DESC' if col.get("descending") else f'"{col["name"]}"'
-        for col in columns
-    )
+    col_sql = _index_column_sql(columns)
     ddl = (
         f'CREATE {unique_kw}INDEX "{target_schema}"."{name}" '
         f'ON "{target_schema}"."{info["table_name"]}" ({col_sql}){reverse_kw}'

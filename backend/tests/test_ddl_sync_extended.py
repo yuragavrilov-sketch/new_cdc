@@ -56,6 +56,42 @@ def test_sync_index_uses_target_schema(monkeypatch):
     assert 'CREATE INDEX "TGT"."IX_ORDERS_ID" ON "TGT"."ORDERS" ("ID")' in target.executed
 
 
+def test_sync_index_creates_function_based_normal_index(monkeypatch):
+    monkeypatch.setattr(
+        ddl_sync_extended,
+        "get_index_info",
+        lambda *_args: {
+            "table_name": "ORDERS",
+            "uniqueness": "NONUNIQUE",
+            "index_type": "FUNCTION-BASED NORMAL",
+            "columns": [
+                {
+                    "name": "SYS_NC00005$",
+                    "expression": 'UPPER("CARD_ID")',
+                    "descending": False,
+                }
+            ],
+        },
+    )
+    target = ConnStub()
+
+    result = ddl_sync_extended.sync_to_target(
+        object(),
+        target,
+        "SRC",
+        "IX_ORDERS_UPPER_CARD",
+        "INDEX",
+        "create_missing",
+        target_schema="TGT",
+    )
+
+    assert result["action"] == "created"
+    assert (
+        'CREATE INDEX "TGT"."IX_ORDERS_UPPER_CARD" '
+        'ON "TGT"."ORDERS" (UPPER("CARD_ID"))'
+    ) in target.executed
+
+
 def test_sync_trigger_uses_target_schema(monkeypatch):
     monkeypatch.setattr(
         ddl_sync_extended,

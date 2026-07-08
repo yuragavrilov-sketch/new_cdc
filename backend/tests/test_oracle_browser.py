@@ -127,12 +127,58 @@ class TableInfoConnStub:
         return TableInfoCursorStub()
 
 
+class IndexInfoCursorStub:
+    def __init__(self):
+        self.sql = ""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, sql: str, params=None, **_kwargs):
+        self.sql = sql.lower()
+        self.params = params
+
+    def fetchone(self):
+        if "from   all_indexes" in self.sql:
+            return ("SRC", "ORDERS", "NONUNIQUE", "FUNCTION-BASED NORMAL", "VALID", "NO", "USERS")
+        return None
+
+    def fetchall(self):
+        if "all_ind_expressions" in self.sql:
+            return [(1, 'UPPER("CARD_ID")')]
+        if "all_ind_columns" in self.sql:
+            return [("SYS_NC00005$", 1, "ASC")]
+        return []
+
+
+class IndexInfoConnStub:
+    def cursor(self):
+        return IndexInfoCursorStub()
+
+
 def test_get_table_info_reports_table_supplemental_logging():
     info = oracle_browser.get_table_info(TableInfoConnStub(), "SRC", "T")
 
     assert info["columns"] == [{"name": "ID", "type": "NUMBER", "nullable": False}]
     assert info["pk_columns"] == ["ID"]
     assert info["supplemental_log_data_all"] == "YES"
+
+
+def test_get_index_info_includes_function_based_expression():
+    info = oracle_browser.get_index_info(IndexInfoConnStub(), "SRC", "IX_ORDERS_UPPER_CARD")
+
+    assert info["index_type"] == "FUNCTION-BASED NORMAL"
+    assert info["columns"] == [
+        {
+            "name": "SYS_NC00005$",
+            "position": 1,
+            "descending": False,
+            "expression": 'UPPER("CARD_ID")',
+        }
+    ]
 
 
 def test_enable_all_disabled_objects_enables_fk_novalidate(monkeypatch):

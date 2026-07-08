@@ -409,15 +409,30 @@ def get_index_info(conn, schema: str, name: str) -> dict:
         if not row:
             return {}
         cur.execute("""
+            SELECT column_position, column_expression
+            FROM   all_ind_expressions
+            WHERE  index_owner = :s AND index_name = :n
+            ORDER  BY column_position
+        """, {"s": schema, "n": name})
+        expressions = {
+            int(position): str(expression).strip()
+            for position, expression in cur.fetchall()
+            if expression is not None
+        }
+        cur.execute("""
             SELECT column_name, column_position, descend
             FROM   all_ind_columns
             WHERE  index_owner = :s AND index_name = :n
             ORDER  BY column_position
         """, {"s": schema, "n": name})
-        cols = [
-            {"name": c[0], "position": c[1], "descending": c[2] == "DESC"}
-            for c in cur.fetchall()
-        ]
+        cols = []
+        for c in cur.fetchall():
+            position = int(c[1])
+            col = {"name": c[0], "position": position, "descending": c[2] == "DESC"}
+            expression = expressions.get(position)
+            if expression:
+                col["expression"] = expression
+            cols.append(col)
     return {
         "table_owner":    row[0],
         "table_name":     row[1],

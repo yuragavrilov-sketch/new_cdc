@@ -235,6 +235,52 @@ def _resolve_ref(conn, owner: str, constraint_name: str):
 
 # ── Indexes ────────────────────────────────────────────────────────────────────
 
+def _index_expressions(conn, schema: str, table: str) -> dict[str, dict[int, str]]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT index_name, column_position, column_expression
+            FROM   all_ind_expressions
+            WHERE  index_owner = :s
+              AND  table_name = :t
+            ORDER  BY index_name, column_position
+        """, {"s": schema.upper(), "t": table.upper()})
+        out: dict[str, dict[int, str]] = {}
+        for index_name, position, expression in cur.fetchall():
+            if expression is None:
+                continue
+            out.setdefault(index_name, {})[int(position)] = str(expression).strip()
+        return out
+
+
+def _supported_index_type(index_type: str) -> bool:
+    index_type = str(index_type or "").upper()
+    return index_type.startswith("NORMAL") or index_type == "FUNCTION-BASED NORMAL"
+
+
+def _index_terms(cols_str: str, expressions: dict[int, str] | None = None) -> list[str]:
+    expressions = expressions or {}
+    terms = []
+    for pos, col in enumerate((cols_str or "").split(","), start=1):
+        expr = expressions.get(pos)
+        if expr:
+            terms.append(expr)
+        elif col.strip():
+            terms.append(f'"{col.strip()}"')
+    return terms
+
+
+def _index_struct_key(uniqueness: str, cols_str: str, expressions: dict[int, str] | None = None) -> tuple:
+    terms = []
+    expressions = expressions or {}
+    for pos, col in enumerate((cols_str or "").split(","), start=1):
+        expr = expressions.get(pos)
+        if expr:
+            terms.append(("expr", " ".join(expr.upper().split())))
+        elif col.strip():
+            terms.append(("col", col.strip().upper()))
+    return (uniqueness, tuple(terms))
+
+
 def _sync_indexes(src_conn, dst_conn, src_schema, src_table, tgt_schema, tgt_table, out):
     # All source indexes (including constraint-backed — we label them separately)
     with src_conn.cursor() as cur:
@@ -251,6 +297,7 @@ def _sync_indexes(src_conn, dst_conn, src_schema, src_table, tgt_schema, tgt_tab
             GROUP BY ai.index_name, ai.uniqueness, ai.index_type
         """, {"s": src_schema.upper(), "t": src_table.upper()})
         src_rows = cur.fetchall()
+    src_exprs = _index_expressions(src_conn, src_schema, src_table)
 
     # Constraint-backed index names on source — these are auto-created with their constraint
     with src_conn.cursor() as cur:
@@ -278,7 +325,11 @@ def _sync_indexes(src_conn, dst_conn, src_schema, src_table, tgt_schema, tgt_tab
         tgt_rows_all = cur.fetchall()
         tgt_names = {r[0] for r in tgt_rows_all}
         # Structural key: (uniqueness, cols) — catches SYS_ renamed indexes
-        tgt_struct = {(r[1], r[2]) for r in tgt_rows_all}
+    tgt_exprs = _index_expressions(dst_conn, tgt_schema, tgt_table)
+    tgt_struct = {
+        _index_struct_key(r[1], r[2], tgt_exprs.get(r[0]))
+        for r in tgt_rows_all
+    }
 
     s = tgt_schema.upper()
     t = tgt_table.upper()
@@ -294,12 +345,13 @@ def _sync_indexes(src_conn, dst_conn, src_schema, src_table, tgt_schema, tgt_tab
             continue
 
         # Structural match — same columns & uniqueness under a different name (SYS_* etc.)
-        if (uniqueness, cols) in tgt_struct:
+        expressions = src_exprs.get(idx_name) or {}
+        if _index_struct_key(uniqueness, cols, expressions) in tgt_struct:
             out["skipped"].append(f"{idx_name} (структурный аналог уже существует)")
             continue
 
-        # Skip function-based / BITMAP — require special DDL
-        if not idx_type.startswith("NORMAL"):
+        # Skip BITMAP/DOMAIN/etc. — require special DDL outside this sync path.
+        if not _supported_index_type(idx_type):
             out["skipped"].append(f"{idx_name} (тип {idx_type} не поддерживается)")
             continue
 
@@ -307,7 +359,7 @@ def _sync_indexes(src_conn, dst_conn, src_schema, src_table, tgt_schema, tgt_tab
         rev_kw    = " REVERSE" if idx_type == "NORMAL/REV" else ""
         ddl = (
             f'CREATE {unique_kw}INDEX "{s}"."{idx_name}" '
-            f'ON "{s}"."{t}" ({_qcols(cols)}){rev_kw}'
+            f'ON "{s}"."{t}" ({", ".join(_index_terms(cols, expressions))}){rev_kw}'
         )
         try:
             with dst_conn.cursor() as cur:
