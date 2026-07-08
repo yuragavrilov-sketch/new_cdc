@@ -1882,6 +1882,11 @@ def _handle_indexes_enabling(mid: str, m: dict) -> None:
 
     state = str(job.get("state") or "").upper()
     if job.get("created"):
+        print(
+            f"[orchestrator] {mid}: target_index job created "
+            f"job_id={job['job_id']} state={state} table={m.get('target_schema')}.{m.get('target_table')}",
+            flush=True,
+        )
         _broadcast({
             "type": "target_index_job",
             "migration_id": mid,
@@ -1894,9 +1899,21 @@ def _handle_indexes_enabling(mid: str, m: dict) -> None:
         return
 
     if state in ("PENDING", "RUNNING"):
+        print(
+            f"[orchestrator] {mid}: target_index job waiting "
+            f"job_id={job.get('job_id')} state={state} worker_id={job.get('worker_id')} "
+            f"started_at={job.get('started_at')} table={m.get('target_schema')}.{m.get('target_table')}",
+            flush=True,
+        )
         return
 
     if state == "FAILED":
+        print(
+            f"[orchestrator] {mid}: target_index job FAILED "
+            f"job_id={job.get('job_id')} worker_id={job.get('worker_id')} "
+            f"error={job.get('error_text')}",
+            flush=True,
+        )
         _update(mid, {
             "error_code": "INDEXES_ENABLE_ERROR",
             "error_text": (job.get("error_text") or "Index enable job failed")[:2000],
@@ -1904,6 +1921,12 @@ def _handle_indexes_enabling(mid: str, m: dict) -> None:
         return
 
     if state == "DONE":
+        print(
+            f"[orchestrator] {mid}: target_index job DONE "
+            f"job_id={job.get('job_id')} worker_id={job.get('worker_id')} "
+            f"enabled_count={job.get('enabled_count')}",
+            flush=True,
+        )
         result = job.get("result_json") or {}
         enabled = result.get("enabled") or {}
         n_idx = len(enabled.get("indexes") or [])

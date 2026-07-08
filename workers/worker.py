@@ -2088,7 +2088,7 @@ def _referencing_foreign_keys(conn, schema: str, table: str, status: str) -> lis
 
 def _target_index_log(tag: str | None, message: str) -> None:
     if tag:
-        print(f"[target_index] {tag} {message}")
+        print(f"[target_index] {tag} {message}", flush=True)
 
 
 def _enable_target_indexes(conn, schema: str, table: str, *, tag: str | None = None) -> dict:
@@ -2153,7 +2153,10 @@ def _enable_target_indexes(conn, schema: str, table: str, *, tag: str | None = N
                             _target_index_log(tag, f"stage=noparallel-reset index={index_name}")
                             cur.execute(f'ALTER INDEX "{s}"."{index_name}" NOPARALLEL')
                         except Exception as np_exc:
-                            print(f"[target_index] {s}.{index_name} NOPARALLEL reset failed: {np_exc}")
+                            print(
+                                f"[target_index] {s}.{index_name} NOPARALLEL reset failed: {np_exc}",
+                                flush=True,
+                            )
                             if _is_dpy_not_connected(np_exc):
                                 raise
                     enabled["indexes"].append(index_name)
@@ -2257,10 +2260,14 @@ def _log_target_index_failure_diagnostics(
     print(
         f"[target_index] {tag} diagnostics err={type(exc).__name__}: {exc} "
         f"stage={stage} job_id={job.get('job_id')} migration_id={job.get('migration_id')} "
-        f"target_connection_id={target_connection_id} table={job.get('target_schema')}.{job.get('target_table')}"
+        f"target_connection_id={target_connection_id} table={job.get('target_schema')}.{job.get('target_table')}",
+        flush=True,
     )
     if _is_dpy_not_connected(exc):
-        print(f"[target_index] {tag} DPY-1001 target_conn {_connection_health(ora_conn)}")
+        print(
+            f"[target_index] {tag} DPY-1001 target_conn {_connection_health(ora_conn)}",
+            flush=True,
+        )
 
 
 def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
@@ -2269,7 +2276,11 @@ def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
     schema = job["target_schema"]
     table = job["target_table"]
     tag = f"{schema}.{table}/{job_id[:8]}"
-    print(f"[target_index] {tag} started")
+    print(
+        f"[target_index] {tag} started migration_id={job.get('migration_id')} "
+        f"target_connection_id={target_connection_id}",
+        flush=True,
+    )
 
     ora_conn = None
     stage = "open-oracle"
@@ -2296,12 +2307,15 @@ def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
             # Non-fatal: FKs whose parent key isn't enabled yet. The orchestrator
             # FK-reconcile (and the parent's own INDEXES_ENABLING) will enable them
             # once the parent is ready.
-            print(f"[target_index] {tag} DONE with {len(deferred)} deferred FK(s) "
-                  f"(parent key not enabled yet): "
-                  f"{', '.join(d['name'] for d in deferred)}")
+            print(
+                f"[target_index] {tag} DONE with {len(deferred)} deferred FK(s) "
+                f"(parent key not enabled yet): "
+                f"{', '.join(d['name'] for d in deferred)}",
+                flush=True,
+            )
         stage = "complete-state"
         db.complete_target_index_job(pg_conn, job_id, result)
-        print(f"[target_index] {tag} DONE")
+        print(f"[target_index] {tag} DONE", flush=True)
     except Exception as exc:
         _log_target_index_failure_diagnostics(
             tag=tag,
@@ -2314,8 +2328,11 @@ def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
         try:
             db.fail_target_index_job(pg_conn, job_id, f"{type(exc).__name__}: {exc}")
         except Exception as fail_exc:
-            print(f"[target_index] {tag} mark-FAILED error: {type(fail_exc).__name__}: {fail_exc}")
-        print(f"[target_index] {tag} FAILED: {type(exc).__name__}: {exc}")
+            print(
+                f"[target_index] {tag} mark-FAILED error: {type(fail_exc).__name__}: {fail_exc}",
+                flush=True,
+            )
+        print(f"[target_index] {tag} FAILED: {type(exc).__name__}: {exc}", flush=True)
     finally:
         if ora_conn is not None:
             try:
@@ -2325,7 +2342,7 @@ def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
 
 
 def target_index_loop(stop_event: threading.Event, poll_interval: int = 5) -> None:
-    print(f"[target_index] loop started (worker_id={WORKER_ID})")
+    print(f"[target_index] loop started (worker_id={WORKER_ID})", flush=True)
     pg = db.get_pg_conn_with_retry()
     try:
         while not stop_event.is_set():
@@ -2334,12 +2351,18 @@ def target_index_loop(stop_event: threading.Event, poll_interval: int = 5) -> No
                 if job is None:
                     time.sleep(poll_interval)
                     continue
+                print(
+                    f"[target_index] claimed job_id={job.get('job_id')} "
+                    f"migration_id={job.get('migration_id')} table={job.get('target_schema')}.{job.get('target_table')} "
+                    f"worker_id={WORKER_ID}",
+                    flush=True,
+                )
                 configs = db.load_configs(pg)
                 process_target_index_job(job, pg, configs)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
-                print(f"[target_index] loop error: {exc}")
+                print(f"[target_index] loop error: {type(exc).__name__}: {exc}", flush=True)
                 try:
                     pg.close()
                 except Exception:
@@ -2357,6 +2380,7 @@ def main() -> None:
     print(f"[worker] state_db={db.STATE_DB_DSN}")
     print(f"[worker] bulk_batch={BULK_BATCH_SIZE}  cdc_batch={CDC_BATCH_SIZE}"
           f"  cdc_scan={CDC_SCAN_INTERVAL}s")
+    print("[worker] diagnostics=target_index_v2 function_based_index_sync")
 
     main_stop = threading.Event()
 
