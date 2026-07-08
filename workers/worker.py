@@ -2083,100 +2083,184 @@ def _referencing_foreign_keys(conn, schema: str, table: str, status: str) -> lis
               AND  fk.status = :status
             ORDER BY fk.owner, fk.table_name, fk.constraint_name
         """, {"s": s, "t": t, "status": status.upper()})
-        return [(row[0], row[1], row[2]) for row in cur.fetchall()]
+    return [(row[0], row[1], row[2]) for row in cur.fetchall()]
 
 
-def _enable_target_indexes(conn, schema: str, table: str) -> dict:
+def _target_index_log(tag: str | None, message: str) -> None:
+    if tag:
+        print(f"[target_index] {tag} {message}")
+
+
+def _enable_target_indexes(conn, schema: str, table: str, *, tag: str | None = None) -> dict:
     s = schema.upper()
     t = table.upper()
-    is_temp = _is_temporary_table(conn, s, t)
-    # PARALLEL only for real tables (GTT indexes can't be NOLOGGING/parallel here).
-    parallel_rebuild = INDEX_REBUILD_PARALLEL and not is_temp
-    if is_temp:
-        rebuild_clause = "REBUILD"
-    elif parallel_rebuild:
-        rebuild_clause = "REBUILD NOLOGGING PARALLEL"
-    else:
-        rebuild_clause = "REBUILD NOLOGGING"
-    enabled = {"indexes": [], "constraints": [], "fk_novalidate": [], "referencing_fk_novalidate": []}
-    errors = {"indexes": [], "constraints": []}
-    # FK enable failures are NOT fatal: enabling an FK (even NOVALIDATE) requires
-    # the referenced parent's PK/UK to be ENABLED. When the parent table is still
-    # mid-migration (its PK temporarily disabled by baseline), the FK can't enable
-    # yet. We collect those here and let the parent's own INDEXES_ENABLING pass (or
-    # the orchestrator FK-reconcile) enable them once the parent is ready, instead
-    # of failing the whole migration.
-    deferred_fk: list[dict] = []
+    stage = "temporary-probe"
+    try:
+        _target_index_log(tag, f"stage={stage} table={s}.{t}")
+        is_temp = _is_temporary_table(conn, s, t)
+        # PARALLEL only for real tables (GTT indexes can't be NOLOGGING/parallel here).
+        parallel_rebuild = INDEX_REBUILD_PARALLEL and not is_temp
+        if is_temp:
+            rebuild_clause = "REBUILD"
+        elif parallel_rebuild:
+            rebuild_clause = "REBUILD NOLOGGING PARALLEL"
+        else:
+            rebuild_clause = "REBUILD NOLOGGING"
+        _target_index_log(
+            tag,
+            f"table temporary={is_temp} parallel_rebuild={parallel_rebuild} "
+            f"rebuild_clause={rebuild_clause}",
+        )
+        enabled = {"indexes": [], "constraints": [], "fk_novalidate": [], "referencing_fk_novalidate": []}
+        errors = {"indexes": [], "constraints": []}
+        # FK enable failures are NOT fatal: enabling an FK (even NOVALIDATE) requires
+        # the referenced parent's PK/UK to be ENABLED. When the parent table is still
+        # mid-migration (its PK temporarily disabled by baseline), the FK can't enable
+        # yet. We collect those here and let the parent's own INDEXES_ENABLING pass (or
+        # the orchestrator FK-reconcile) enable them once the parent is ready, instead
+        # of failing the whole migration.
+        deferred_fk: list[dict] = []
 
-    with conn.cursor() as cur:
-        cur.execute(f'ALTER TABLE "{s}"."{t}" LOGGING')
+        with conn.cursor() as cur:
+            stage = "alter-table-logging"
+            _target_index_log(tag, f"stage={stage} sql=ALTER TABLE {s}.{t} LOGGING")
+            cur.execute(f'ALTER TABLE "{s}"."{t}" LOGGING')
 
-        cur.execute("""
-            SELECT index_name
-            FROM   all_indexes
-            WHERE  owner = :s
-              AND  table_name = :t
-              AND  status = 'UNUSABLE'
-            ORDER BY index_name
-        """, {"s": s, "t": t})
-        indexes = [row[0] for row in cur.fetchall()]
-        for index_name in indexes:
-            try:
-                cur.execute(f'ALTER INDEX "{s}"."{index_name}" {rebuild_clause}')
-                if parallel_rebuild:
-                    # Reset the degree so later DML/queries don't silently go
-                    # parallel just because we rebuilt with PARALLEL.
-                    try:
-                        cur.execute(f'ALTER INDEX "{s}"."{index_name}" NOPARALLEL')
-                    except Exception as np_exc:
-                        print(f"[target_index] {s}.{index_name} NOPARALLEL reset failed: {np_exc}")
-                enabled["indexes"].append(index_name)
-            except Exception as exc:
-                errors["indexes"].append({"name": index_name, "error": str(exc)})
-
-        cur.execute("""
-            SELECT constraint_name, constraint_type
-            FROM   all_constraints
-            WHERE  owner = :s
-              AND  table_name = :t
-              AND  status = 'DISABLED'
-              AND  constraint_type IN ('P','U','R','C')
-            ORDER BY constraint_type, constraint_name
-        """, {"s": s, "t": t})
-        constraints = [(row[0], row[1]) for row in cur.fetchall()]
-        for constraint_name, constraint_type in constraints:
-            try:
-                if constraint_type == "R":
-                    cur.execute(
-                        f'ALTER TABLE "{s}"."{t}" ENABLE NOVALIDATE CONSTRAINT "{constraint_name}"'
+            stage = "list-unusable-indexes"
+            _target_index_log(tag, f"stage={stage}")
+            cur.execute("""
+                SELECT index_name
+                FROM   all_indexes
+                WHERE  owner = :s
+                  AND  table_name = :t
+                  AND  status = 'UNUSABLE'
+                ORDER BY index_name
+            """, {"s": s, "t": t})
+            indexes = [row[0] for row in cur.fetchall()]
+            _target_index_log(tag, f"unusable_indexes count={len(indexes)} names={','.join(indexes) or 'none'}")
+            for index_name in indexes:
+                stage = f"rebuild-index {index_name}"
+                try:
+                    _target_index_log(
+                        tag,
+                        f"stage={stage} sql=ALTER INDEX {s}.{index_name} {rebuild_clause}",
                     )
-                    enabled["fk_novalidate"].append(constraint_name)
-                else:
-                    cur.execute(
-                        f'ALTER TABLE "{s}"."{t}" ENABLE CONSTRAINT "{constraint_name}"'
+                    cur.execute(f'ALTER INDEX "{s}"."{index_name}" {rebuild_clause}')
+                    if parallel_rebuild:
+                        # Reset the degree so later DML/queries don't silently go
+                        # parallel just because we rebuilt with PARALLEL.
+                        try:
+                            _target_index_log(tag, f"stage=noparallel-reset index={index_name}")
+                            cur.execute(f'ALTER INDEX "{s}"."{index_name}" NOPARALLEL')
+                        except Exception as np_exc:
+                            print(f"[target_index] {s}.{index_name} NOPARALLEL reset failed: {np_exc}")
+                            if _is_dpy_not_connected(np_exc):
+                                raise
+                    enabled["indexes"].append(index_name)
+                    _target_index_log(tag, f"index {index_name} rebuilt")
+                except Exception as exc:
+                    _target_index_log(tag, f"index {index_name} failed err={type(exc).__name__}: {exc}")
+                    if _is_dpy_not_connected(exc):
+                        raise
+                    errors["indexes"].append({"name": index_name, "error": str(exc)})
+
+            stage = "list-disabled-constraints"
+            _target_index_log(tag, f"stage={stage}")
+            cur.execute("""
+                SELECT constraint_name, constraint_type
+                FROM   all_constraints
+                WHERE  owner = :s
+                  AND  table_name = :t
+                  AND  status = 'DISABLED'
+                  AND  constraint_type IN ('P','U','R','C')
+                ORDER BY constraint_type, constraint_name
+            """, {"s": s, "t": t})
+            constraints = [(row[0], row[1]) for row in cur.fetchall()]
+            constraint_summary = ",".join(f"{name}:{ctype}" for name, ctype in constraints) or "none"
+            _target_index_log(tag, f"disabled_constraints count={len(constraints)} names={constraint_summary}")
+            for constraint_name, constraint_type in constraints:
+                stage = f"enable-constraint {constraint_name}"
+                try:
+                    if constraint_type == "R":
+                        _target_index_log(
+                            tag,
+                            f"stage={stage} type=R mode=NOVALIDATE",
+                        )
+                        cur.execute(
+                            f'ALTER TABLE "{s}"."{t}" ENABLE NOVALIDATE CONSTRAINT "{constraint_name}"'
+                        )
+                        enabled["fk_novalidate"].append(constraint_name)
+                    else:
+                        _target_index_log(
+                            tag,
+                            f"stage={stage} type={constraint_type} mode=VALIDATE",
+                        )
+                        cur.execute(
+                            f'ALTER TABLE "{s}"."{t}" ENABLE CONSTRAINT "{constraint_name}"'
+                        )
+                        enabled["constraints"].append(constraint_name)
+                except Exception as exc:
+                    _target_index_log(
+                        tag,
+                        f"constraint {constraint_name} failed err={type(exc).__name__}: {exc}",
                     )
-                    enabled["constraints"].append(constraint_name)
-            except Exception as exc:
-                if constraint_type == "R":
-                    # FK failure → defer (parent PK may not be enabled yet).
-                    deferred_fk.append({"name": constraint_name, "error": str(exc)})
-                else:
-                    # PK/UK/CHECK failure → fatal.
-                    errors["constraints"].append({"name": constraint_name, "error": str(exc)})
+                    if _is_dpy_not_connected(exc):
+                        raise
+                    if constraint_type == "R":
+                        # FK failure → defer (parent PK may not be enabled yet).
+                        deferred_fk.append({"name": constraint_name, "error": str(exc)})
+                    else:
+                        # PK/UK/CHECK failure → fatal.
+                        errors["constraints"].append({"name": constraint_name, "error": str(exc)})
 
-        for owner, child_table, constraint_name in _referencing_foreign_keys(conn, s, t, "DISABLED"):
-            display_name = f"{owner}.{child_table}.{constraint_name}"
-            try:
-                cur.execute(
-                    f'ALTER TABLE "{owner}"."{child_table}" ENABLE NOVALIDATE CONSTRAINT "{constraint_name}"'
-                )
-                enabled["referencing_fk_novalidate"].append(display_name)
-            except Exception as exc:
-                # Referencing FK failure → defer, never fatal.
-                deferred_fk.append({"name": display_name, "error": str(exc)})
+            stage = "list-referencing-fk"
+            _target_index_log(tag, f"stage={stage}")
+            referencing = _referencing_foreign_keys(conn, s, t, "DISABLED")
+            _target_index_log(tag, f"referencing_fk count={len(referencing)}")
+            for owner, child_table, constraint_name in referencing:
+                display_name = f"{owner}.{child_table}.{constraint_name}"
+                stage = f"enable-referencing-fk {display_name}"
+                try:
+                    _target_index_log(tag, f"stage={stage} mode=NOVALIDATE")
+                    cur.execute(
+                        f'ALTER TABLE "{owner}"."{child_table}" ENABLE NOVALIDATE CONSTRAINT "{constraint_name}"'
+                    )
+                    enabled["referencing_fk_novalidate"].append(display_name)
+                except Exception as exc:
+                    _target_index_log(
+                        tag,
+                        f"referencing_fk {display_name} failed err={type(exc).__name__}: {exc}",
+                    )
+                    if _is_dpy_not_connected(exc):
+                        raise
+                    # Referencing FK failure → defer, never fatal.
+                    deferred_fk.append({"name": display_name, "error": str(exc)})
 
-    conn.commit()
-    return {"enabled": enabled, "deferred_fk": deferred_fk, "errors": errors}
+        stage = "commit"
+        _target_index_log(tag, f"stage={stage}")
+        conn.commit()
+        return {"enabled": enabled, "deferred_fk": deferred_fk, "errors": errors}
+    except Exception as exc:
+        _target_index_log(tag, f"FAILED stage={stage} err={type(exc).__name__}: {exc}")
+        raise
+
+
+def _log_target_index_failure_diagnostics(
+    *,
+    tag: str,
+    exc: Exception,
+    job: dict,
+    target_connection_id: str,
+    stage: str,
+    ora_conn,
+) -> None:
+    print(
+        f"[target_index] {tag} diagnostics err={type(exc).__name__}: {exc} "
+        f"stage={stage} job_id={job.get('job_id')} migration_id={job.get('migration_id')} "
+        f"target_connection_id={target_connection_id} table={job.get('target_schema')}.{job.get('target_table')}"
+    )
+    if _is_dpy_not_connected(exc):
+        print(f"[target_index] {tag} DPY-1001 target_conn {_connection_health(ora_conn)}")
 
 
 def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
@@ -2188,6 +2272,7 @@ def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
     print(f"[target_index] {tag} started")
 
     ora_conn = None
+    stage = "open-oracle"
     try:
         ora_conn = db.open_oracle(
             target_connection_id,
@@ -2197,7 +2282,8 @@ def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
                 table=f"{schema}.{table}",
             ),
         )
-        result = _enable_target_indexes(ora_conn, schema, table)
+        stage = "enable-target-indexes"
+        result = _enable_target_indexes(ora_conn, schema, table, tag=tag)
         err_count = len(result["errors"]["indexes"]) + len(result["errors"]["constraints"])
         if err_count:
             names = [e["name"] for e in result["errors"]["indexes"]]
@@ -2213,10 +2299,22 @@ def process_target_index_job(job: dict, pg_conn, configs: dict) -> None:
             print(f"[target_index] {tag} DONE with {len(deferred)} deferred FK(s) "
                   f"(parent key not enabled yet): "
                   f"{', '.join(d['name'] for d in deferred)}")
+        stage = "complete-state"
         db.complete_target_index_job(pg_conn, job_id, result)
         print(f"[target_index] {tag} DONE")
     except Exception as exc:
-        db.fail_target_index_job(pg_conn, job_id, f"{type(exc).__name__}: {exc}")
+        _log_target_index_failure_diagnostics(
+            tag=tag,
+            exc=exc,
+            job=job,
+            target_connection_id=target_connection_id,
+            stage=stage,
+            ora_conn=ora_conn,
+        )
+        try:
+            db.fail_target_index_job(pg_conn, job_id, f"{type(exc).__name__}: {exc}")
+        except Exception as fail_exc:
+            print(f"[target_index] {tag} mark-FAILED error: {type(fail_exc).__name__}: {fail_exc}")
         print(f"[target_index] {tag} FAILED: {type(exc).__name__}: {exc}")
     finally:
         if ora_conn is not None:

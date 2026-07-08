@@ -240,3 +240,45 @@ def test_process_target_index_job_fails_on_pk_error(monkeypatch):
 
     assert completed == []
     assert len(failed) == 1
+
+
+def test_process_target_index_job_logs_dpy1001_diagnostics(monkeypatch, capsys):
+    class BrokenConn:
+        closed = False
+
+        def cursor(self):
+            raise RuntimeError("DPY-1001: not connected to database")
+
+        def close(self):
+            self.closed = True
+
+    conn = BrokenConn()
+    completed, failed = [], []
+    monkeypatch.setattr(worker.db, "open_oracle", lambda *_a: conn)
+    monkeypatch.setattr(worker.db, "complete_target_index_job",
+                        lambda _pg, job_id, result: completed.append((job_id, result)))
+    monkeypatch.setattr(worker.db, "fail_target_index_job",
+                        lambda _pg, job_id, err: failed.append((job_id, err)))
+
+    job = {
+        "job_id": "job-dpy",
+        "migration_id": "migration-1",
+        "target_connection_id": "oracle_target",
+        "target_schema": "TCBPAY",
+        "target_table": "ISS#ORDERS",
+    }
+
+    worker.process_target_index_job(job, object(), {})
+
+    out = capsys.readouterr().out
+    assert "TCBPAY.ISS#ORDERS/job-dpy started" in out
+    assert "stage=temporary-probe table=TCBPAY.ISS#ORDERS" in out
+    assert "FAILED stage=temporary-probe err=RuntimeError: DPY-1001" in out
+    assert "diagnostics err=RuntimeError: DPY-1001" in out
+    assert "stage=enable-target-indexes" in out
+    assert "DPY-1001 target_conn present=true type=BrokenConn closed_attr=False" in out
+    assert "select1=failed:RuntimeError:DPY-1001: not connected to database" in out
+    assert "FAILED: RuntimeError: DPY-1001: not connected to database" in out
+    assert completed == []
+    assert failed == [("job-dpy", "RuntimeError: DPY-1001: not connected to database")]
+    assert conn.closed is True
