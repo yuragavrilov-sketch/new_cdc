@@ -547,6 +547,203 @@ def test_bulk_chunk_logs_flush_context_on_oracle_protocol_error(monkeypatch, cap
     assert "secret-clob-data" not in out
 
 
+def test_parse_ora00001_constraint_keeps_hash_table_names():
+    owner, constraint = worker._parse_ora00001_constraint(
+        Exception(
+            "ORA-00001: unique constraint "
+            "(TCBPAY.MERCHANTS#SBPTRANSFERS_ORDERID) violated"
+        ),
+        "TARGET",
+    )
+
+    assert owner == "TCBPAY"
+    assert constraint == "MERCHANTS#SBPTRANSFERS_ORDERID"
+
+
+def test_bulk_ora00001_diagnostics_logs_constraint_and_duplicate_stats(capsys):
+    class PgCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql, _params=None):
+            pass
+
+        def fetchone(self):
+            return ("RUNNING", 2, 100, "worker-1", "claimed", "started", None)
+
+    class PgConn:
+        def cursor(self):
+            return PgCursor()
+
+    class TargetCursor:
+        def __init__(self, conn):
+            self.conn = conn
+            self.result = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, _params=None):
+            compact = " ".join(sql.split())
+            self.conn.executed.append(compact)
+            if "FROM all_constraints c" in compact:
+                self.result = (
+                    "TCBPAY",
+                    "MERCHANTS#SBPTRANSFERS_ORDERID",
+                    "U",
+                    "ENABLED",
+                    "VALIDATED",
+                    "TCBPAY",
+                    "MERCHANTS#SBPTRANSFERS_ORDERID",
+                    "ORDERID",
+                )
+            elif "FROM all_indexes i" in compact:
+                self.result = (
+                    "TCBPAY",
+                    "MERCHANTS#SBPTRANSFERS_ORDERID",
+                    "UNIQUE",
+                    "VALID",
+                    "ORDERID",
+                )
+            elif "FROM all_tables" in compact:
+                self.result = (1234, 55, "analyzed")
+            elif "ROWNUM <= 1" in compact:
+                self.result = (1,)
+            else:
+                raise AssertionError(f"unexpected SQL: {compact}")
+
+        def fetchone(self):
+            return self.result
+
+    class TargetConn:
+        def __init__(self):
+            self.executed = []
+            self.closed = False
+
+        def cursor(self):
+            return TargetCursor(self)
+
+        def close(self):
+            self.closed = True
+
+    class SourceCursor:
+        def __init__(self):
+            self.result = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, _params=None):
+            compact = " ".join(sql.split())
+            if "HAVING COUNT(*) > 1" in compact:
+                self.result = (1,)
+            elif "GROUP BY" in compact:
+                self.result = (4,)
+            else:
+                self.result = (5,)
+
+        def fetchone(self):
+            return self.result
+
+    class SourceConn:
+        def cursor(self):
+            return SourceCursor()
+
+    target_conn = TargetConn()
+    chunk = {
+        "chunk_id": "chunk-ora-00001",
+        "chunk_seq": 29,
+        "retry_count": 2,
+        "rows_loaded": 100,
+        "source_schema": "TCBPAY",
+        "source_table": "MERCHANTS#SBPTRANSFERS",
+        "target_schema": "TCBPAY",
+        "rowid_start": "AAAA",
+        "rowid_end": "BBBB",
+    }
+
+    worker._log_bulk_unique_violation_diagnostics(
+        tag="chunk-or",
+        exc=Exception(
+            "ORA-00001: unique constraint "
+            "(TCBPAY.MERCHANTS#SBPTRANSFERS_ORDERID) violated"
+        ),
+        chunk=chunk,
+        pg_conn=PgConn(),
+        src_conn=SourceConn(),
+        open_target_conn=lambda: target_conn,
+        dest_table="MERCHANTS#SBPTRANSFERS",
+        start_scn=None,
+        batch=[{"c0": 1}, {"c0": 1}, {"c0": None}],
+        bind_names=["c0"],
+        cursor_description=[("ORDERID", "NUMT", None, None)],
+    )
+
+    out = capsys.readouterr().out
+    assert "ORA-00001 diagnostics begin constraint=TCBPAY.MERCHANTS#SBPTRANSFERS_ORDERID" in out
+    assert "pg_chunk_state status=RUNNING retry_count=2 rows_loaded=100" in out
+    assert "target_constraint owner=TCBPAY name=MERCHANTS#SBPTRANSFERS_ORDERID" in out
+    assert "target_index owner=TCBPAY name=MERCHANTS#SBPTRANSFERS_ORDERID" in out
+    assert "target_table table=TCBPAY.MERCHANTS#SBPTRANSFERS has_rows=True sample_rows=1" in out
+    assert "stats_num_rows=1234 stats_blocks=55 last_analyzed=analyzed" in out
+    assert "batch_key_stats rows=3 key_columns=ORDERID" in out
+    assert "null_key_rows=1 duplicate_key_rows=1" in out
+    assert "source_chunk_stats table=TCBPAY.MERCHANTS#SBPTRANSFERS rows=5" in out
+    assert "distinct_key_groups=4 duplicate_key_groups=1" in out
+    assert target_conn.closed is True
+
+
+def test_dpy1001_diagnostics_logs_connection_health(capsys):
+    class PingConn:
+        def __init__(self, name, exc=None):
+            self.name = name
+            self.exc = exc
+            self.closed = False
+
+        def ping(self):
+            if self.exc:
+                raise self.exc
+
+    worker._log_oracle_connection_error_diagnostics(
+        tag="chunk-dp",
+        exc=RuntimeError("DPY-1001: not connected to database"),
+        chunk={
+            "chunk_seq": 7,
+            "retry_count": 1,
+            "rows_loaded": 200,
+        },
+        stage="flush batch=2",
+        src_label="TCBPAY.SRC",
+        dest_label="TCBPAY.DST",
+        rows_loaded=200,
+        batch_no=2,
+        batch_rows=100,
+        source_has_lob=True,
+        fetch_batch_size=100,
+        fallback_mode=True,
+        last_lob_summary="c1/DOC",
+        src_conn=PingConn("source"),
+        dst_conn=PingConn("target", RuntimeError("DPY-1001: not connected to database")),
+    )
+
+    out = capsys.readouterr().out
+    assert "DPY-1001 diagnostics begin" in out
+    assert "stage=flush batch=2" in out
+    assert "chunk_retry=1 chunk_rows_loaded_pg=200" in out
+    assert "DPY-1001 source_conn present=true type=PingConn closed_attr=False ping=ok" in out
+    assert "DPY-1001 target_conn present=true type=PingConn closed_attr=False" in out
+    assert "ping=failed:RuntimeError:DPY-1001: not connected to database" in out
+
+
 # ---------------------------------------------------------------------------
 # LOBs are now compared by length (worker and route must agree)
 # ---------------------------------------------------------------------------

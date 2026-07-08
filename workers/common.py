@@ -214,14 +214,23 @@ def claim_chunk(conn) -> Optional[dict]:
                    started_at = NOW()
             WHERE  chunk_id = (SELECT chunk_id FROM candidate)
             RETURNING chunk_id, migration_id, chunk_seq, rowid_start, rowid_end,
-                      COALESCE(chunk_type, 'BULK')
+                      COALESCE(chunk_type, 'BULK'), rows_loaded, retry_count
         """, (WORKER_ID,))
         row = cur.fetchone()
         if not row:
             conn.rollback()
             return None
 
-        chunk_id, migration_id, chunk_seq, rowid_start, rowid_end, chunk_type = row
+        (
+            chunk_id,
+            migration_id,
+            chunk_seq,
+            rowid_start,
+            rowid_end,
+            chunk_type,
+            rows_loaded,
+            retry_count,
+        ) = row
 
         cur.execute("""
             SELECT source_connection_id, target_connection_id,
@@ -249,6 +258,8 @@ def claim_chunk(conn) -> Optional[dict]:
         "chunk_type":           chunk_type,
         "rowid_start":          rowid_start,
         "rowid_end":            rowid_end,
+        "rows_loaded":          rows_loaded,
+        "retry_count":          retry_count,
         "source_connection_id": src_conn_id,
         "target_connection_id": dst_conn_id,
         "source_schema":        src_schema,

@@ -24,6 +24,7 @@ Environment variables (see .env.example):
 import base64
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -200,6 +201,15 @@ def _compact_sql(sql: str, limit: int = 1200) -> str:
     return compact if len(compact) <= limit else compact[:limit - 3] + "..."
 
 
+def _quote_oracle_ident(name: str) -> str:
+    escaped = str(name).upper().replace('"', '""')
+    return f'"{escaped}"'
+
+
+def _oracle_table_ref(schema: str, table: str) -> str:
+    return f"{_quote_oracle_ident(schema)}.{_quote_oracle_ident(table)}"
+
+
 def _dbtype_name(dbtype) -> str:
     return getattr(dbtype, "name", None) or str(dbtype)
 
@@ -271,6 +281,10 @@ def _cursor_description_summary(description, limit: int = 2000) -> str:
 
 
 _ORACLE_PROTOCOL_ERRORS = ("ORA-03106", "ORA-03113", "ORA-03114")
+_ORA00001_CONSTRAINT_RE = re.compile(
+    r"unique constraint\s*\((?P<constraint>[^)]+)\)\s*violated",
+    re.IGNORECASE,
+)
 
 
 def _is_oracle_protocol_error(exc: Exception) -> bool:
@@ -278,8 +292,441 @@ def _is_oracle_protocol_error(exc: Exception) -> bool:
     return any(code in text for code in _ORACLE_PROTOCOL_ERRORS)
 
 
+def _is_ora00001(exc: Exception) -> bool:
+    return "ORA-00001" in str(exc)
+
+
+def _is_dpy_not_connected(exc: Exception) -> bool:
+    return "DPY-1001" in str(exc) or "not connected to database" in str(exc).lower()
+
+
+def _parse_ora00001_constraint(exc: Exception, default_owner: str) -> tuple[str | None, str | None]:
+    match = _ORA00001_CONSTRAINT_RE.search(str(exc))
+    if not match:
+        return (None, None)
+    raw = match.group("constraint").strip().replace('"', "")
+    if "." in raw:
+        owner, constraint_name = raw.split(".", 1)
+    else:
+        owner, constraint_name = default_owner, raw
+    return (owner.upper(), constraint_name.upper())
+
+
 def _conventional_insert_sql(insert_sql: str) -> str:
     return insert_sql.replace("INSERT /*+ APPEND_VALUES */", "INSERT", 1)
+
+
+def _split_columns(csv_text) -> list[str]:
+    if not csv_text:
+        return []
+    return [part.strip().upper() for part in str(csv_text).split(",") if part.strip()]
+
+
+def _read_unique_definition(conn, owner: str | None, constraint_name: str | None) -> dict:
+    result = {"constraint": None, "index": None, "columns": []}
+    if not owner or not constraint_name:
+        return result
+
+    owner = owner.upper()
+    constraint_name = constraint_name.upper()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT c.owner, c.constraint_name, c.constraint_type, c.status,
+                   c.validated, c.index_owner, c.index_name,
+                   LISTAGG(cc.column_name, ',') WITHIN GROUP (ORDER BY cc.position) AS key_columns
+            FROM   all_constraints c
+            JOIN   all_cons_columns cc
+              ON   cc.owner = c.owner
+             AND   cc.constraint_name = c.constraint_name
+            WHERE  c.owner = :owner
+              AND  c.constraint_name = :constraint_name
+            GROUP  BY c.owner, c.constraint_name, c.constraint_type, c.status,
+                      c.validated, c.index_owner, c.index_name
+        """, {"owner": owner, "constraint_name": constraint_name})
+        row = cur.fetchone()
+
+    index_owner = owner
+    index_name = constraint_name
+    if row:
+        (
+            c_owner,
+            c_name,
+            c_type,
+            c_status,
+            c_validated,
+            c_index_owner,
+            c_index_name,
+            c_columns,
+        ) = row
+        key_columns = _split_columns(c_columns)
+        result["constraint"] = {
+            "owner": c_owner,
+            "name": c_name,
+            "type": c_type,
+            "status": c_status,
+            "validated": c_validated,
+            "index_owner": c_index_owner,
+            "index_name": c_index_name,
+        }
+        result["columns"] = key_columns
+        index_owner = str(c_index_owner or owner).upper()
+        index_name = str(c_index_name or constraint_name).upper()
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT i.owner, i.index_name, i.uniqueness, i.status,
+                   LISTAGG(ic.column_name, ',') WITHIN GROUP (ORDER BY ic.column_position) AS key_columns
+            FROM   all_indexes i
+            JOIN   all_ind_columns ic
+              ON   ic.index_owner = i.owner
+             AND   ic.index_name = i.index_name
+            WHERE  i.owner = :owner
+              AND  i.index_name = :index_name
+            GROUP  BY i.owner, i.index_name, i.uniqueness, i.status
+        """, {"owner": index_owner, "index_name": index_name})
+        row = cur.fetchone()
+    if row:
+        i_owner, i_name, uniqueness, status, i_columns = row
+        index_columns = _split_columns(i_columns)
+        result["index"] = {
+            "owner": i_owner,
+            "name": i_name,
+            "uniqueness": uniqueness,
+            "status": status,
+        }
+        if not result["columns"]:
+            result["columns"] = index_columns
+
+    return result
+
+
+def _read_target_table_snapshot(conn, schema: str, table: str) -> dict:
+    snapshot = {
+        "has_rows": None,
+        "sample_rows": None,
+        "stats_num_rows": None,
+        "stats_blocks": None,
+        "last_analyzed": None,
+    }
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT num_rows, blocks, last_analyzed
+            FROM   all_tables
+            WHERE  owner = :owner
+              AND  table_name = :table_name
+        """, {"owner": schema.upper(), "table_name": table.upper()})
+        row = cur.fetchone()
+    if row:
+        snapshot["stats_num_rows"] = row[0]
+        snapshot["stats_blocks"] = row[1]
+        snapshot["last_analyzed"] = row[2]
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {_oracle_table_ref(schema, table)} WHERE ROWNUM <= 1")
+        row = cur.fetchone()
+    sample_rows = int(row[0] or 0)
+    snapshot["sample_rows"] = sample_rows
+    snapshot["has_rows"] = sample_rows > 0
+    return snapshot
+
+
+def _flashback_suffix(start_scn: int | None) -> str:
+    return " AS OF SCN :p_scn" if start_scn else ""
+
+
+def _rowid_params(rowid_start: str, rowid_end: str, start_scn: int | None) -> dict:
+    params = {"p_start": rowid_start, "p_end": rowid_end}
+    if start_scn:
+        params["p_scn"] = start_scn
+    return params
+
+
+def _read_source_chunk_key_stats(
+    conn,
+    schema: str,
+    table: str,
+    rowid_start: str,
+    rowid_end: str,
+    start_scn: int | None,
+    key_columns: list[str],
+) -> dict:
+    table_ref = _oracle_table_ref(schema, table)
+    flashback = _flashback_suffix(start_scn)
+    params = _rowid_params(rowid_start, rowid_end, start_scn)
+    rowid_where = "ROWID BETWEEN CHARTOROWID(:p_start) AND CHARTOROWID(:p_end)"
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT COUNT(*) FROM {table_ref}{flashback} WHERE {rowid_where}",
+            params,
+        )
+        rows_count = int(cur.fetchone()[0] or 0)
+
+    stats = {
+        "rows": rows_count,
+        "distinct_key_groups": None,
+        "duplicate_key_groups": None,
+    }
+    if not key_columns:
+        return stats
+
+    key_expr = ", ".join(_quote_oracle_ident(col) for col in key_columns)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT COUNT(*) FROM ("
+            f"SELECT {key_expr} FROM {table_ref}{flashback} "
+            f"WHERE {rowid_where} GROUP BY {key_expr})",
+            params,
+        )
+        stats["distinct_key_groups"] = int(cur.fetchone()[0] or 0)
+        cur.execute(
+            f"SELECT COUNT(*) FROM ("
+            f"SELECT {key_expr} FROM {table_ref}{flashback} "
+            f"WHERE {rowid_where} GROUP BY {key_expr} HAVING COUNT(*) > 1)",
+            params,
+        )
+        stats["duplicate_key_groups"] = int(cur.fetchone()[0] or 0)
+    return stats
+
+
+def _hashable_diagnostic_value(value):
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    try:
+        hash(value)
+        return value
+    except Exception:
+        return repr(value)
+
+
+def _batch_key_stats(batch: list, bind_names: list[str], cursor_description, key_columns: list[str]) -> dict:
+    result = {
+        "rows": len(batch),
+        "key_columns": key_columns,
+        "missing_columns": [],
+        "null_key_rows": None,
+        "duplicate_key_rows": None,
+    }
+    if not key_columns or not cursor_description:
+        return result
+
+    column_to_bind = {
+        str(col[0]).upper(): bind_names[i]
+        for i, col in enumerate(cursor_description)
+        if i < len(bind_names)
+    }
+    bind_key = []
+    missing = []
+    for column in key_columns:
+        bind_name = column_to_bind.get(column.upper())
+        if bind_name:
+            bind_key.append(bind_name)
+        else:
+            missing.append(column)
+    result["missing_columns"] = missing
+    if missing:
+        return result
+
+    null_key_rows = 0
+    keys = []
+    for row in batch:
+        key = tuple(_hashable_diagnostic_value(row.get(bind_name)) for bind_name in bind_key)
+        if any(row.get(bind_name) is None for bind_name in bind_key):
+            null_key_rows += 1
+        keys.append(key)
+    result["null_key_rows"] = null_key_rows
+    result["duplicate_key_rows"] = len(keys) - len(set(keys))
+    return result
+
+
+def _log_pg_chunk_state(pg_conn, tag: str, chunk_id: str) -> None:
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute("""
+                SELECT status, retry_count, rows_loaded, worker_id,
+                       claimed_at, started_at, completed_at
+                FROM   migration_chunks
+                WHERE  chunk_id = %s
+            """, (chunk_id,))
+            row = cur.fetchone()
+    except Exception as exc:
+        print(f"[bulk:{tag}] ORA-00001 pg_chunk_state unavailable err={type(exc).__name__}: {exc}")
+        return
+    if not row:
+        print(f"[bulk:{tag}] ORA-00001 pg_chunk_state missing")
+        return
+    status, retry_count, rows_loaded, worker_id, claimed_at, started_at, completed_at = row
+    print(
+        f"[bulk:{tag}] ORA-00001 pg_chunk_state status={status} "
+        f"retry_count={retry_count} rows_loaded={rows_loaded} worker_id={worker_id} "
+        f"claimed_at={claimed_at} started_at={started_at} completed_at={completed_at}"
+    )
+
+
+def _connection_health(conn) -> str:
+    if conn is None:
+        return "present=false"
+    parts = [f"present=true type={type(conn).__name__}"]
+    closed = getattr(conn, "closed", None)
+    if closed is not None:
+        parts.append(f"closed_attr={closed}")
+    ping = getattr(conn, "ping", None)
+    if callable(ping):
+        try:
+            ping()
+            parts.append("ping=ok")
+            return " ".join(parts)
+        except Exception as exc:
+            parts.append(f"ping=failed:{type(exc).__name__}:{exc}")
+            return " ".join(parts)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM dual")
+            cur.fetchone()
+        parts.append("select1=ok")
+    except Exception as exc:
+        parts.append(f"select1=failed:{type(exc).__name__}:{exc}")
+    return " ".join(parts)
+
+
+def _log_oracle_connection_error_diagnostics(
+    *,
+    tag: str,
+    exc: Exception,
+    chunk: dict,
+    stage: str,
+    src_label: str,
+    dest_label: str,
+    rows_loaded: int,
+    batch_no: int,
+    batch_rows: int,
+    source_has_lob: bool,
+    fetch_batch_size: int,
+    fallback_mode: bool,
+    last_lob_summary: str,
+    src_conn,
+    dst_conn,
+) -> None:
+    print(
+        f"[bulk:{tag}] DPY-1001 diagnostics begin err={type(exc).__name__}: {exc} "
+        f"stage={stage} src={src_label} dest={dest_label} "
+        f"chunk_seq={chunk.get('chunk_seq')} chunk_retry={chunk.get('retry_count', 'n/a')} "
+        f"chunk_rows_loaded_pg={chunk.get('rows_loaded', 'n/a')} "
+        f"rows_loaded={rows_loaded} batch={batch_no} batch_rows={batch_rows} "
+        f"source_has_lob={source_has_lob} fetch_batch={fetch_batch_size} "
+        f"fallback_mode={fallback_mode} lob_summary={last_lob_summary}"
+    )
+    print(f"[bulk:{tag}] DPY-1001 source_conn {_connection_health(src_conn)}")
+    print(f"[bulk:{tag}] DPY-1001 target_conn {_connection_health(dst_conn)}")
+
+
+def _log_bulk_unique_violation_diagnostics(
+    *,
+    tag: str,
+    exc: Exception,
+    chunk: dict,
+    pg_conn,
+    src_conn,
+    open_target_conn,
+    dest_table: str,
+    start_scn: int | None,
+    batch: list,
+    bind_names: list[str],
+    cursor_description,
+) -> None:
+    chunk_id = chunk["chunk_id"]
+    src_schema = chunk["source_schema"]
+    src_table = chunk["source_table"]
+    tgt_schema = chunk["target_schema"]
+    owner, constraint_name = _parse_ora00001_constraint(exc, tgt_schema)
+    print(
+        f"[bulk:{tag}] ORA-00001 diagnostics begin constraint="
+        f"{owner + '.' + constraint_name if owner and constraint_name else 'unknown'} "
+        f"src={src_schema}.{src_table} dest={tgt_schema}.{dest_table} "
+        f"chunk_seq={chunk.get('chunk_seq')} chunk_retry={chunk.get('retry_count', 'n/a')} "
+        f"chunk_rows_loaded_pg={chunk.get('rows_loaded', 'n/a')} "
+        f"rowid={chunk.get('rowid_start')}..{chunk.get('rowid_end')} "
+        f"batch_rows={len(batch)} start_scn={start_scn or 'current'}"
+    )
+    _log_pg_chunk_state(pg_conn, tag, chunk_id)
+
+    key_columns: list[str] = []
+    target_conn = None
+    try:
+        target_conn = open_target_conn()
+        definition = _read_unique_definition(target_conn, owner, constraint_name)
+        key_columns = definition.get("columns") or []
+        constraint = definition.get("constraint")
+        if constraint:
+            print(
+                f"[bulk:{tag}] ORA-00001 target_constraint owner={constraint['owner']} "
+                f"name={constraint['name']} type={constraint['type']} "
+                f"status={constraint['status']} validated={constraint['validated']} "
+                f"index={constraint.get('index_owner')}.{constraint.get('index_name')} "
+                f"columns={','.join(key_columns) or 'unknown'}"
+            )
+        else:
+            print(
+                f"[bulk:{tag}] ORA-00001 target_constraint not_found "
+                f"owner={owner or 'unknown'} name={constraint_name or 'unknown'}"
+            )
+        index = definition.get("index")
+        if index:
+            print(
+                f"[bulk:{tag}] ORA-00001 target_index owner={index['owner']} "
+                f"name={index['name']} uniqueness={index['uniqueness']} "
+                f"status={index['status']} columns={','.join(key_columns) or 'unknown'}"
+            )
+        target_snapshot = _read_target_table_snapshot(target_conn, tgt_schema, dest_table)
+        print(
+            f"[bulk:{tag}] ORA-00001 target_table table={tgt_schema}.{dest_table} "
+            f"has_rows={target_snapshot['has_rows']} sample_rows={target_snapshot['sample_rows']} "
+            f"stats_num_rows={target_snapshot['stats_num_rows']} "
+            f"stats_blocks={target_snapshot['stats_blocks']} "
+            f"last_analyzed={target_snapshot['last_analyzed']}"
+        )
+    except Exception as diag_exc:
+        print(
+            f"[bulk:{tag}] ORA-00001 target_diagnostics_failed "
+            f"err={type(diag_exc).__name__}: {diag_exc}"
+        )
+    finally:
+        if target_conn is not None:
+            try:
+                target_conn.close()
+            except Exception:
+                pass
+
+    batch_stats = _batch_key_stats(batch, bind_names, cursor_description, key_columns)
+    print(
+        f"[bulk:{tag}] ORA-00001 batch_key_stats rows={batch_stats['rows']} "
+        f"key_columns={','.join(batch_stats['key_columns']) or 'unknown'} "
+        f"missing_columns={','.join(batch_stats['missing_columns']) or 'none'} "
+        f"null_key_rows={batch_stats['null_key_rows']} "
+        f"duplicate_key_rows={batch_stats['duplicate_key_rows']}"
+    )
+
+    try:
+        source_stats = _read_source_chunk_key_stats(
+            src_conn,
+            src_schema,
+            src_table,
+            chunk["rowid_start"],
+            chunk["rowid_end"],
+            start_scn,
+            key_columns,
+        )
+        print(
+            f"[bulk:{tag}] ORA-00001 source_chunk_stats table={src_schema}.{src_table} "
+            f"rows={source_stats['rows']} key_columns={','.join(key_columns) or 'unknown'} "
+            f"distinct_key_groups={source_stats['distinct_key_groups']} "
+            f"duplicate_key_groups={source_stats['duplicate_key_groups']}"
+        )
+    except Exception as diag_exc:
+        print(
+            f"[bulk:{tag}] ORA-00001 source_diagnostics_failed "
+            f"err={type(diag_exc).__name__}: {diag_exc}"
+        )
 
 
 def _execute_batch_no_commit(dst_conn, insert_sql: str, batch: list,
@@ -355,6 +802,8 @@ def _flush_batch_fallback(
                 f"[bulk:{tag}] fallback failed batch={batch_no} "
                 f"fallback_batch_rows={slice_size} err={type(exc).__name__}: {exc}"
             )
+            if _is_dpy_not_connected(exc):
+                print(f"[bulk:{tag}] DPY-1001 fallback_conn {_connection_health(conn)}")
             raise
         finally:
             try:
@@ -389,7 +838,10 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
     stage = "start"
     batch_no = 0
     batch_rows = 0
+    batch = []
     insert_sql = ""
+    bind_names: list[str] = []
+    cursor_description = []
     last_lob_summary = "none"
     lob_bind_columns: dict = {}
     lob_inputsizes: dict = {}
@@ -426,7 +878,9 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
             f"[bulk:{tag}] start seq={chunk.get('chunk_seq')} strategy={strategy} "
             f"src={src_label} dest={dest_label} uses_stage={uses_stage} "
             f"start_scn={start_scn or 'current'} rowid={rowid_start}..{rowid_end} "
-            f"bulk_batch={BULK_BATCH_SIZE} lob_batch={BULK_LOB_BATCH_SIZE}"
+            f"bulk_batch={BULK_BATCH_SIZE} lob_batch={BULK_LOB_BATCH_SIZE} "
+            f"chunk_retry={chunk.get('retry_count', 'n/a')} "
+            f"chunk_rows_loaded_pg={chunk.get('rows_loaded', 'n/a')}"
         )
         stage = "chunk-active"
         _ensure_chunk_active(pg_conn, chunk_id)
@@ -477,16 +931,17 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
                     {"p_start": rowid_start, "p_end": rowid_end},
                 )
             stage = "build-insert"
+            cursor_description = list(cur.description or [])
             insert_sql, bind_names, lob_inputsizes = _build_insert(
-                cur.description, tgt_schema, dest_table, source_lob_column_types)
+                cursor_description, tgt_schema, dest_table, source_lob_column_types)
             lob_bind_columns = {
                 bind_names[i]: col[0]
-                for i, col in enumerate(cur.description or [])
+                for i, col in enumerate(cursor_description)
                 if bind_names[i] in lob_inputsizes
             }
             print(
-                f"[bulk:{tag}] source_describe columns={len(cur.description or [])} "
-                f"desc={_cursor_description_summary(cur.description)}"
+                f"[bulk:{tag}] source_describe columns={len(cursor_description)} "
+                f"desc={_cursor_description_summary(cursor_description)}"
             )
             print(
                 f"[bulk:{tag}] target_insert bind_count={len(bind_names)} "
@@ -560,6 +1015,38 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
             except Exception: pass
         raise
     except Exception as exc:
+        if _is_dpy_not_connected(exc):
+            _log_oracle_connection_error_diagnostics(
+                tag=tag,
+                exc=exc,
+                chunk=chunk,
+                stage=stage,
+                src_label=src_label,
+                dest_label=dest_label,
+                rows_loaded=rows_loaded,
+                batch_no=batch_no,
+                batch_rows=batch_rows,
+                source_has_lob=source_has_lob,
+                fetch_batch_size=fetch_batch_size,
+                fallback_mode=fallback_mode,
+                last_lob_summary=last_lob_summary,
+                src_conn=src_conn,
+                dst_conn=dst_conn,
+            )
+        if _is_ora00001(exc):
+            _log_bulk_unique_violation_diagnostics(
+                tag=tag,
+                exc=exc,
+                chunk=chunk,
+                pg_conn=pg_conn,
+                src_conn=src_conn,
+                open_target_conn=lambda: _open_target_conn(f"bulk-ora00001 {chunk_id[:8]}"),
+                dest_table=dest_table,
+                start_scn=start_scn,
+                batch=batch,
+                bind_names=bind_names,
+                cursor_description=cursor_description,
+            )
         print(
             f"[bulk:{tag}] FAILED stage={stage} err={type(exc).__name__}: {exc} "
             f"src={src_label} dest={dest_label} strategy={strategy} "
@@ -704,8 +1191,12 @@ def process_chunk(chunk: dict, pg_conn, configs: dict) -> None:
     chunk_id   = chunk["chunk_id"]
     chunk_type = chunk.get("chunk_type", "BULK")
 
-    print(f"[worker] chunk {chunk_id} seq={chunk['chunk_seq']}"
-          f" type={chunk_type} ({chunk['rowid_start']}..{chunk['rowid_end']})")
+    print(
+        f"[worker] chunk {chunk_id} seq={chunk['chunk_seq']}"
+        f" type={chunk_type} retry={chunk.get('retry_count', 'n/a')}"
+        f" rows_loaded_pg={chunk.get('rows_loaded', 'n/a')}"
+        f" ({chunk['rowid_start']}..{chunk['rowid_end']})"
+    )
 
     try:
         if chunk_type == "BASELINE":
