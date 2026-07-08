@@ -288,6 +288,147 @@ def test_bulk_chunk_uses_lob_fetch_batch_for_lob_source_table(monkeypatch):
     assert dst_conn.commits == 1
 
 
+def test_bulk_chunk_falls_back_to_conventional_split_after_protocol_error(monkeypatch, capsys):
+    class SourceCursor:
+        description = [("ID", "NUMT", None, None), ("DOC", "CLOBT", None, None)]
+
+        def __init__(self):
+            self.arraysize = None
+            self.prefetchrows = None
+            self.data_query = False
+            self._rows_fetched = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            self.data_query = "ROWID BETWEEN" in " ".join(sql.split())
+
+        def fetchall(self):
+            return [("DOC", "CLOB")]
+
+        def fetchmany(self, _size):
+            if self._rows_fetched:
+                return []
+            self._rows_fetched = True
+            return [
+                (1, "doc-1"),
+                (2, "doc-2"),
+                (3, "doc-3"),
+                (4, "doc-4"),
+            ]
+
+    class SourceConn:
+        def __init__(self):
+            self.cursor_obj = SourceCursor()
+
+        def cursor(self):
+            return self.cursor_obj
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    class TargetCursor:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def setinputsizes(self, **kwargs):
+            self.conn.inputsizes.append(kwargs)
+
+        def executemany(self, sql, batch):
+            self.conn.calls.append((sql, list(batch)))
+            if self.conn.fail_protocol:
+                raise RuntimeError("ORA-03106: fatal two-task communication protocol error")
+
+    class TargetConn:
+        def __init__(self, *, fail_protocol=False):
+            self.fail_protocol = fail_protocol
+            self.calls = []
+            self.inputsizes = []
+            self.commits = 0
+            self.rollbacks = 0
+            self.closed = False
+
+        def cursor(self):
+            return TargetCursor(self)
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+        def close(self):
+            self.closed = True
+
+    src_conn = SourceConn()
+    fast_target = TargetConn(fail_protocol=True)
+    fallback_target = TargetConn()
+    target_conns = [fast_target, fallback_target]
+    progress = []
+    chunk = {
+        "chunk_id": "chunk-fallback",
+        "chunk_seq": 7,
+        "migration_id": "migration-1",
+        "source_connection_id": "oracle_source",
+        "target_connection_id": "oracle_target",
+        "source_schema": "TCBPAY",
+        "source_table": "FORM#FINGERPRINTS",
+        "target_schema": "TCBPAY",
+        "target_table": "FORM#FINGERPRINTS",
+        "stage_table": "",
+        "strategy": "CDC_DIRECT",
+        "start_scn": None,
+        "rowid_start": "AAAA",
+        "rowid_end": "BBBB",
+    }
+
+    def open_oracle(conn_id, *_args):
+        if conn_id == "oracle_source":
+            return src_conn
+        return target_conns.pop(0)
+
+    monkeypatch.setattr(worker, "BULK_BATCH_SIZE", 20_000)
+    monkeypatch.setattr(worker, "BULK_LOB_BATCH_SIZE", 20_000, raising=False)
+    monkeypatch.setattr(worker, "BULK_FALLBACK_BATCH_SIZE", 2, raising=False)
+    monkeypatch.setattr(worker, "_LOB_DBTYPES", ("CLOBT",))
+    monkeypatch.setattr(worker, "_LOB_BIND_DBTYPE_BY_DATA_TYPE", {"CLOB": "CLOBT"})
+    monkeypatch.setattr(worker.db, "chunk_is_active", lambda *_args: True)
+    monkeypatch.setattr(worker.db, "update_chunk_progress", lambda _pg, cid, rows: progress.append((cid, rows)))
+    monkeypatch.setattr(worker.db, "open_oracle", open_oracle)
+
+    rows_loaded = worker._process_bulk_chunk(chunk, "pg-conn", {})
+
+    assert rows_loaded == 4
+    assert fast_target.rollbacks == 1
+    assert fast_target.closed is True
+    assert fallback_target.commits == 1
+    assert fallback_target.closed is True
+    assert len(fallback_target.calls) == 2
+    assert [len(batch) for _sql, batch in fallback_target.calls] == [2, 2]
+    assert all("APPEND_VALUES" not in sql for sql, _batch in fallback_target.calls)
+    assert all("INSERT INTO" in sql for sql, _batch in fallback_target.calls)
+    assert fallback_target.inputsizes == [{"c1": "CLOBT"}, {"c1": "CLOBT"}]
+    assert progress == [("chunk-fallback", 4)]
+
+    out = capsys.readouterr().out
+    assert "[bulk:chunk-fa] fallback start reason=ORA_PROTOCOL_ERROR" in out
+    assert "append_values=false" in out
+    assert "fallback done rows=4" in out
+
+
 def test_bulk_chunk_logs_flush_context_on_oracle_protocol_error(monkeypatch, capsys):
     class SourceCursor:
         description = [("ID", "NUMT", None, None), ("DOC", "CLOBT", None, None)]

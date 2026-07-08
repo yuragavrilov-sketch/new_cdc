@@ -12,6 +12,7 @@ Environment variables (see .env.example):
     WORKER_ID          Unique identifier        (default: hostname:pid)
     BULK_BATCH_SIZE    Rows per INSERT batch    (default: 5000)
     BULK_LOB_BATCH_SIZE Optional rows per INSERT batch cap for LOB tables (default: BULK_BATCH_SIZE)
+    BULK_FALLBACK_BATCH_SIZE Rows per conventional fallback INSERT batch (default: 1000)
     BULK_POLL_INTERVAL Seconds between polls    (default: 5)
     CDC_BATCH_SIZE     Kafka records per cycle  (default: 500)
     CDC_CHECKIN_SEC    Seconds between checkins (default: 30)
@@ -78,6 +79,7 @@ except ImportError:
 
 BULK_BATCH_SIZE    = int(os.environ.get("BULK_BATCH_SIZE",    20_000))
 BULK_LOB_BATCH_SIZE = max(1, int(os.environ.get("BULK_LOB_BATCH_SIZE", BULK_BATCH_SIZE)))
+BULK_FALLBACK_BATCH_SIZE = max(1, int(os.environ.get("BULK_FALLBACK_BATCH_SIZE", 1_000)))
 BULK_POLL_INTERVAL = int(os.environ.get("BULK_POLL_INTERVAL", 5))
 CDC_BATCH_SIZE     = int(os.environ.get("CDC_BATCH_SIZE",     500))
 CDC_CHECKIN_SEC    = int(os.environ.get("CDC_CHECKIN_SEC",    30))
@@ -268,14 +270,97 @@ def _cursor_description_summary(description, limit: int = 2000) -> str:
     return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
-def _flush_batch(dst_conn, insert_sql: str, batch: list,
-                 lob_inputsizes: dict | None = None) -> None:
-    """Execute one batch insert and commit."""
+_ORACLE_PROTOCOL_ERRORS = ("ORA-03106", "ORA-03113", "ORA-03114")
+
+
+def _is_oracle_protocol_error(exc: Exception) -> bool:
+    text = str(exc)
+    return any(code in text for code in _ORACLE_PROTOCOL_ERRORS)
+
+
+def _conventional_insert_sql(insert_sql: str) -> str:
+    return insert_sql.replace("INSERT /*+ APPEND_VALUES */", "INSERT", 1)
+
+
+def _execute_batch_no_commit(dst_conn, insert_sql: str, batch: list,
+                             lob_inputsizes: dict | None = None) -> None:
     with dst_conn.cursor() as ic:
         if lob_inputsizes:
             ic.setinputsizes(**lob_inputsizes)
         ic.executemany(insert_sql, batch)
+
+
+def _flush_batch(dst_conn, insert_sql: str, batch: list,
+                 lob_inputsizes: dict | None = None) -> None:
+    """Execute one batch insert and commit."""
+    _execute_batch_no_commit(dst_conn, insert_sql, batch, lob_inputsizes)
     dst_conn.commit()
+
+
+def _flush_batch_fallback(
+    open_target_conn,
+    insert_sql: str,
+    batch: list,
+    lob_inputsizes: dict | None,
+    *,
+    tag: str,
+    batch_no: int,
+    lob_summary: str,
+) -> None:
+    """Retry a failed bulk batch conventionally, splitting on protocol errors.
+
+    The whole original batch is committed only after every fallback slice
+    succeeds. If a protocol error breaks the connection mid-attempt, the
+    attempt is rolled back/closed and retried from the beginning with a smaller
+    slice size, avoiding partial commits inside the chunk.
+    """
+    fallback_sql = _conventional_insert_sql(insert_sql)
+    slice_size = min(len(batch), BULK_FALLBACK_BATCH_SIZE)
+    while True:
+        print(
+            f"[bulk:{tag}] fallback start reason=ORA_PROTOCOL_ERROR "
+            f"batch={batch_no} rows={len(batch)} fallback_batch_rows={slice_size} "
+            f"append_values=false lob_summary={lob_summary}"
+        )
+        conn = open_target_conn()
+        try:
+            for offset in range(0, len(batch), slice_size):
+                _execute_batch_no_commit(
+                    conn,
+                    fallback_sql,
+                    batch[offset:offset + slice_size],
+                    lob_inputsizes,
+                )
+            conn.commit()
+            print(
+                f"[bulk:{tag}] fallback done rows={len(batch)} "
+                f"fallback_batch_rows={slice_size}"
+            )
+            return
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if _is_oracle_protocol_error(exc) and slice_size > 1:
+                next_size = max(1, slice_size // 2)
+                print(
+                    f"[bulk:{tag}] fallback split after protocol error "
+                    f"batch={batch_no} fallback_batch_rows={slice_size}->{next_size} "
+                    f"err={type(exc).__name__}: {exc}"
+                )
+                slice_size = next_size
+                continue
+            print(
+                f"[bulk:{tag}] fallback failed batch={batch_no} "
+                f"fallback_batch_rows={slice_size} err={type(exc).__name__}: {exc}"
+            )
+            raise
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
@@ -309,6 +394,7 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
     lob_bind_columns: dict = {}
     lob_inputsizes: dict = {}
     source_lob_column_types: dict = {}
+    fallback_mode = False
 
     src_conn = db.open_oracle(
         chunk["source_connection_id"],
@@ -320,16 +406,20 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
             table=f"{src_schema}.{src_table}",
         ),
     )
-    dst_conn = db.open_oracle(
-        chunk["target_connection_id"],
-        configs,
-        _session_context(
-            f"bulk-dst {chunk_id[:8]}",
-            migration_id=migration_id,
-            chunk_id=chunk_id,
-            table=f"{tgt_schema}.{dest_table}",
-        ),
-    )
+
+    def _open_target_conn(action: str = ""):
+        return db.open_oracle(
+            chunk["target_connection_id"],
+            configs,
+            _session_context(
+                action or f"bulk-dst {chunk_id[:8]}",
+                migration_id=migration_id,
+                chunk_id=chunk_id,
+                table=f"{tgt_schema}.{dest_table}",
+            ),
+        )
+
+    dst_conn = _open_target_conn()
     rows_loaded = 0
     try:
         print(
@@ -422,7 +512,45 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
                         f"rows_loaded={rows_loaded} lob_summary={last_lob_summary}"
                     )
                 stage = f"flush batch={batch_no}"
-                _flush_batch(dst_conn, insert_sql, batch, lob_inputsizes)
+                if fallback_mode:
+                    _flush_batch_fallback(
+                        lambda: _open_target_conn(f"bulk-fallback {chunk_id[:8]}"),
+                        insert_sql,
+                        batch,
+                        lob_inputsizes,
+                        tag=tag,
+                        batch_no=batch_no,
+                        lob_summary=last_lob_summary,
+                    )
+                else:
+                    try:
+                        _flush_batch(dst_conn, insert_sql, batch, lob_inputsizes)
+                    except Exception as exc:
+                        if not _is_oracle_protocol_error(exc):
+                            raise
+                        print(
+                            f"[bulk:{tag}] protocol error on fast flush; "
+                            f"switching chunk to fallback mode err={type(exc).__name__}: {exc}"
+                        )
+                        try:
+                            dst_conn.rollback()
+                        except Exception:
+                            pass
+                        try:
+                            dst_conn.close()
+                        except Exception:
+                            pass
+                        dst_conn = None
+                        fallback_mode = True
+                        _flush_batch_fallback(
+                            lambda: _open_target_conn(f"bulk-fallback {chunk_id[:8]}"),
+                            insert_sql,
+                            batch,
+                            lob_inputsizes,
+                            tag=tag,
+                            batch_no=batch_no,
+                            lob_summary=last_lob_summary,
+                        )
                 rows_loaded += len(batch)
                 db.update_chunk_progress(pg_conn, chunk_id, rows_loaded)
                 print(f"  → {rows_loaded} rows")
@@ -438,7 +566,7 @@ def _process_bulk_chunk(chunk: dict, pg_conn, configs: dict) -> None:
             f"rows_loaded={rows_loaded} batch={batch_no} batch_rows={batch_rows} "
             f"source_has_lob={source_has_lob} fetch_batch={fetch_batch_size} "
             f"start_scn={start_scn or 'current'} rowid={rowid_start}..{rowid_end} "
-            f"lob_summary={last_lob_summary}"
+            f"fallback_mode={fallback_mode} lob_summary={last_lob_summary}"
         )
         if insert_sql:
             print(f"[bulk:{tag}] failed_insert_sql={_compact_sql(insert_sql)}")
