@@ -70,6 +70,71 @@ def test_enable_target_indexes_enables_referencing_fk_novalidate():
     assert conn.committed
 
 
+def test_enable_target_indexes_lists_referencing_fk_with_live_cursor_only():
+    class StrictCursor:
+        def __init__(self, conn):
+            self.conn = conn
+            self.sql = ""
+            self.closed = True
+
+        def __enter__(self):
+            self.closed = False
+            self.conn.open_cursors += 1
+            self.conn.max_open_cursors = max(self.conn.max_open_cursors, self.conn.open_cursors)
+            return self
+
+        def __exit__(self, *_exc):
+            self.closed = True
+            self.conn.open_cursors -= 1
+            return False
+
+        def execute(self, sql, params=None):
+            self.sql = sql
+            self.conn.executed.append((sql, params))
+            if "FROM   all_constraints fk" in sql and self.conn.open_cursors != 1:
+                raise RuntimeError("DPY-1006: cursor is not open")
+
+        def fetchone(self):
+            if self.closed:
+                raise RuntimeError("DPY-1006: cursor is not open")
+            if "FROM   all_tables" in self.sql:
+                return ("N",)
+            return None
+
+        def fetchall(self):
+            if self.closed:
+                raise RuntimeError("DPY-1006: cursor is not open")
+            if "FROM   all_indexes" in self.sql:
+                return []
+            if "constraint_type IN ('P','U','R','C')" in self.sql:
+                return [("PK_PARENT", "P")]
+            if "FROM   all_constraints fk" in self.sql:
+                return [("TGT", "CHILD", "FK_CHILD_PARENT")]
+            return []
+
+    class StrictConn:
+        def __init__(self):
+            self.executed = []
+            self.open_cursors = 0
+            self.max_open_cursors = 0
+            self.committed = False
+
+        def cursor(self):
+            return StrictCursor(self)
+
+        def commit(self):
+            self.committed = True
+
+    conn = StrictConn()
+
+    result = worker._enable_target_indexes(conn, "TGT", "PARENT")
+
+    assert result["enabled"]["constraints"] == ["PK_PARENT"]
+    assert result["enabled"]["referencing_fk_novalidate"] == ["TGT.CHILD.FK_CHILD_PARENT"]
+    assert conn.max_open_cursors == 1
+    assert conn.committed is True
+
+
 # ---------------------------------------------------------------------------
 # Deferred-FK behaviour: FK enable failures must NOT fail the migration; index
 # and PK/UK/CHECK failures must stay fatal.

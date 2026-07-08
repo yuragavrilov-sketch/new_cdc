@@ -2114,7 +2114,7 @@ def _referencing_foreign_keys(conn, schema: str, table: str, status: str) -> lis
               AND  fk.status = :status
             ORDER BY fk.owner, fk.table_name, fk.constraint_name
         """, {"s": s, "t": t, "status": status.upper()})
-    return [(row[0], row[1], row[2]) for row in cur.fetchall()]
+        return [(row[0], row[1], row[2]) for row in cur.fetchall()]
 
 
 def _target_index_log(tag: str | None, message: str) -> None:
@@ -2122,10 +2122,11 @@ def _target_index_log(tag: str | None, message: str) -> None:
         print(f"[target_index] {tag} {message}", flush=True)
 
 
-def _target_index_execute_ddl(cur, sql: str, *, tag: str | None, stage: str) -> None:
+def _target_index_execute_ddl(conn, sql: str, *, tag: str | None, stage: str) -> None:
     for attempt in range(1, TARGET_INDEX_DDL_RETRIES + 1):
         try:
-            cur.execute(sql)
+            with conn.cursor() as cur:
+                cur.execute(sql)
             return
         except Exception as exc:
             if not _is_ora00054(exc) or attempt >= TARGET_INDEX_DDL_RETRIES:
@@ -2137,6 +2138,17 @@ def _target_index_execute_ddl(cur, sql: str, *, tag: str | None, stage: str) -> 
             )
             if TARGET_INDEX_DDL_RETRY_SLEEP_SEC:
                 time.sleep(TARGET_INDEX_DDL_RETRY_SLEEP_SEC)
+
+
+def _target_index_execute(conn, sql: str, params: dict | None = None) -> None:
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+
+
+def _target_index_fetchall(conn, sql: str, params: dict | None = None) -> list:
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
 
 
 def _enable_target_indexes(
@@ -2181,78 +2193,87 @@ def _enable_target_indexes(
         # of failing the whole migration.
         deferred_fk: list[dict] = []
 
-        with conn.cursor() as cur:
-            if TARGET_INDEX_DDL_LOCK_TIMEOUT > 0:
-                stage = "set-ddl-lock-timeout"
-                _target_index_log(
-                    tag,
-                    f"stage={stage} seconds={TARGET_INDEX_DDL_LOCK_TIMEOUT}",
-                )
-                cur.execute(f"ALTER SESSION SET DDL_LOCK_TIMEOUT = {TARGET_INDEX_DDL_LOCK_TIMEOUT}")
-
-            stage = "alter-table-logging"
-            _target_index_log(tag, f"stage={stage} sql=ALTER TABLE {s}.{t} LOGGING")
-            _target_index_execute_ddl(
-                cur,
-                f'ALTER TABLE "{s}"."{t}" LOGGING',
-                tag=tag,
-                stage=stage,
+        if TARGET_INDEX_DDL_LOCK_TIMEOUT > 0:
+            stage = "set-ddl-lock-timeout"
+            _target_index_log(
+                tag,
+                f"stage={stage} seconds={TARGET_INDEX_DDL_LOCK_TIMEOUT}",
             )
+            _target_index_execute(conn, f"ALTER SESSION SET DDL_LOCK_TIMEOUT = {TARGET_INDEX_DDL_LOCK_TIMEOUT}")
 
-            stage = "list-unusable-indexes"
-            _target_index_log(tag, f"stage={stage}")
-            cur.execute("""
+        stage = "alter-table-logging"
+        _target_index_log(tag, f"stage={stage} sql=ALTER TABLE {s}.{t} LOGGING")
+        _target_index_execute_ddl(
+            conn,
+            f'ALTER TABLE "{s}"."{t}" LOGGING',
+            tag=tag,
+            stage=stage,
+        )
+
+        stage = "list-unusable-indexes"
+        _target_index_log(tag, f"stage={stage}")
+        indexes = [
+            row[0]
+            for row in _target_index_fetchall(
+                conn,
+                """
                 SELECT index_name
                 FROM   all_indexes
                 WHERE  owner = :s
                   AND  table_name = :t
                   AND  status = 'UNUSABLE'
                 ORDER BY index_name
-            """, {"s": s, "t": t})
-            indexes = [row[0] for row in cur.fetchall()]
-            _target_index_log(tag, f"unusable_indexes count={len(indexes)} names={','.join(indexes) or 'none'}")
-            for index_name in indexes:
-                stage = f"rebuild-index {index_name}"
-                try:
-                    _target_index_log(
-                        tag,
-                        f"stage={stage} sql=ALTER INDEX {s}.{index_name} {rebuild_clause}",
-                    )
-                    _target_index_execute_ddl(
-                        cur,
-                        f'ALTER INDEX "{s}"."{index_name}" {rebuild_clause}',
-                        tag=tag,
-                        stage=stage,
-                    )
-                    if parallel_rebuild:
-                        # Reset the degree so later DML/queries don't silently go
-                        # parallel just because we rebuilt with PARALLEL.
-                        try:
-                            _target_index_log(tag, f"stage=noparallel-reset index={index_name}")
-                            _target_index_execute_ddl(
-                                cur,
-                                f'ALTER INDEX "{s}"."{index_name}" NOPARALLEL',
-                                tag=tag,
-                                stage="noparallel-reset",
-                            )
-                        except Exception as np_exc:
-                            print(
-                                f"[target_index] {s}.{index_name} NOPARALLEL reset failed: {np_exc}",
-                                flush=True,
-                            )
-                            if _is_dpy_not_connected(np_exc):
-                                raise
-                    enabled["indexes"].append(index_name)
-                    _target_index_log(tag, f"index {index_name} rebuilt")
-                except Exception as exc:
-                    _target_index_log(tag, f"index {index_name} failed err={type(exc).__name__}: {exc}")
-                    if _is_dpy_not_connected(exc):
-                        raise
-                    errors["indexes"].append({"name": index_name, "error": str(exc)})
+                """,
+                {"s": s, "t": t},
+            )
+        ]
+        _target_index_log(tag, f"unusable_indexes count={len(indexes)} names={','.join(indexes) or 'none'}")
+        for index_name in indexes:
+            stage = f"rebuild-index {index_name}"
+            try:
+                _target_index_log(
+                    tag,
+                    f"stage={stage} sql=ALTER INDEX {s}.{index_name} {rebuild_clause}",
+                )
+                _target_index_execute_ddl(
+                    conn,
+                    f'ALTER INDEX "{s}"."{index_name}" {rebuild_clause}',
+                    tag=tag,
+                    stage=stage,
+                )
+                if parallel_rebuild:
+                    # Reset the degree so later DML/queries don't silently go
+                    # parallel just because we rebuilt with PARALLEL.
+                    try:
+                        _target_index_log(tag, f"stage=noparallel-reset index={index_name}")
+                        _target_index_execute_ddl(
+                            conn,
+                            f'ALTER INDEX "{s}"."{index_name}" NOPARALLEL',
+                            tag=tag,
+                            stage="noparallel-reset",
+                        )
+                    except Exception as np_exc:
+                        print(
+                            f"[target_index] {s}.{index_name} NOPARALLEL reset failed: {np_exc}",
+                            flush=True,
+                        )
+                        if _is_dpy_not_connected(np_exc):
+                            raise
+                enabled["indexes"].append(index_name)
+                _target_index_log(tag, f"index {index_name} rebuilt")
+            except Exception as exc:
+                _target_index_log(tag, f"index {index_name} failed err={type(exc).__name__}: {exc}")
+                if _is_dpy_not_connected(exc):
+                    raise
+                errors["indexes"].append({"name": index_name, "error": str(exc)})
 
-            stage = "list-disabled-constraints"
-            _target_index_log(tag, f"stage={stage}")
-            cur.execute("""
+        stage = "list-disabled-constraints"
+        _target_index_log(tag, f"stage={stage}")
+        constraints = [
+            (row[0], row[1])
+            for row in _target_index_fetchall(
+                conn,
+                """
                 SELECT constraint_name, constraint_type
                 FROM   all_constraints
                 WHERE  owner = :s
@@ -2260,76 +2281,78 @@ def _enable_target_indexes(
                   AND  status = 'DISABLED'
                   AND  constraint_type IN ('P','U','R','C')
                 ORDER BY constraint_type, constraint_name
-            """, {"s": s, "t": t})
-            constraints = [(row[0], row[1]) for row in cur.fetchall()]
-            constraint_summary = ",".join(f"{name}:{ctype}" for name, ctype in constraints) or "none"
-            _target_index_log(tag, f"disabled_constraints count={len(constraints)} names={constraint_summary}")
-            for constraint_name, constraint_type in constraints:
-                stage = f"enable-constraint {constraint_name}"
-                try:
-                    if constraint_type == "R":
-                        _target_index_log(
-                            tag,
-                            f"stage={stage} type=R mode=NOVALIDATE",
-                        )
-                        _target_index_execute_ddl(
-                            cur,
-                            f'ALTER TABLE "{s}"."{t}" ENABLE NOVALIDATE CONSTRAINT "{constraint_name}"',
-                            tag=tag,
-                            stage=stage,
-                        )
-                        enabled["fk_novalidate"].append(constraint_name)
-                    else:
-                        _target_index_log(
-                            tag,
-                            f"stage={stage} type={constraint_type} mode=VALIDATE",
-                        )
-                        _target_index_execute_ddl(
-                            cur,
-                            f'ALTER TABLE "{s}"."{t}" ENABLE CONSTRAINT "{constraint_name}"',
-                            tag=tag,
-                            stage=stage,
-                        )
-                        enabled["constraints"].append(constraint_name)
-                except Exception as exc:
+                """,
+                {"s": s, "t": t},
+            )
+        ]
+        constraint_summary = ",".join(f"{name}:{ctype}" for name, ctype in constraints) or "none"
+        _target_index_log(tag, f"disabled_constraints count={len(constraints)} names={constraint_summary}")
+        for constraint_name, constraint_type in constraints:
+            stage = f"enable-constraint {constraint_name}"
+            try:
+                if constraint_type == "R":
                     _target_index_log(
                         tag,
-                        f"constraint {constraint_name} failed err={type(exc).__name__}: {exc}",
+                        f"stage={stage} type=R mode=NOVALIDATE",
                     )
-                    if _is_dpy_not_connected(exc):
-                        raise
-                    if constraint_type == "R":
-                        # FK failure → defer (parent PK may not be enabled yet).
-                        deferred_fk.append({"name": constraint_name, "error": str(exc)})
-                    else:
-                        # PK/UK/CHECK failure → fatal.
-                        errors["constraints"].append({"name": constraint_name, "error": str(exc)})
-
-            stage = "list-referencing-fk"
-            _target_index_log(tag, f"stage={stage}")
-            referencing = _referencing_foreign_keys(conn, s, t, "DISABLED")
-            _target_index_log(tag, f"referencing_fk count={len(referencing)}")
-            for owner, child_table, constraint_name in referencing:
-                display_name = f"{owner}.{child_table}.{constraint_name}"
-                stage = f"enable-referencing-fk {display_name}"
-                try:
-                    _target_index_log(tag, f"stage={stage} mode=NOVALIDATE")
                     _target_index_execute_ddl(
-                        cur,
-                        f'ALTER TABLE "{owner}"."{child_table}" ENABLE NOVALIDATE CONSTRAINT "{constraint_name}"',
+                        conn,
+                        f'ALTER TABLE "{s}"."{t}" ENABLE NOVALIDATE CONSTRAINT "{constraint_name}"',
                         tag=tag,
                         stage=stage,
                     )
-                    enabled["referencing_fk_novalidate"].append(display_name)
-                except Exception as exc:
+                    enabled["fk_novalidate"].append(constraint_name)
+                else:
                     _target_index_log(
                         tag,
-                        f"referencing_fk {display_name} failed err={type(exc).__name__}: {exc}",
+                        f"stage={stage} type={constraint_type} mode=VALIDATE",
                     )
-                    if _is_dpy_not_connected(exc):
-                        raise
-                    # Referencing FK failure → defer, never fatal.
-                    deferred_fk.append({"name": display_name, "error": str(exc)})
+                    _target_index_execute_ddl(
+                        conn,
+                        f'ALTER TABLE "{s}"."{t}" ENABLE CONSTRAINT "{constraint_name}"',
+                        tag=tag,
+                        stage=stage,
+                    )
+                    enabled["constraints"].append(constraint_name)
+            except Exception as exc:
+                _target_index_log(
+                    tag,
+                    f"constraint {constraint_name} failed err={type(exc).__name__}: {exc}",
+                )
+                if _is_dpy_not_connected(exc):
+                    raise
+                if constraint_type == "R":
+                    # FK failure -> defer (parent PK may not be enabled yet).
+                    deferred_fk.append({"name": constraint_name, "error": str(exc)})
+                else:
+                    # PK/UK/CHECK failure -> fatal.
+                    errors["constraints"].append({"name": constraint_name, "error": str(exc)})
+
+        stage = "list-referencing-fk"
+        _target_index_log(tag, f"stage={stage}")
+        referencing = _referencing_foreign_keys(conn, s, t, "DISABLED")
+        _target_index_log(tag, f"referencing_fk count={len(referencing)}")
+        for owner, child_table, constraint_name in referencing:
+            display_name = f"{owner}.{child_table}.{constraint_name}"
+            stage = f"enable-referencing-fk {display_name}"
+            try:
+                _target_index_log(tag, f"stage={stage} mode=NOVALIDATE")
+                _target_index_execute_ddl(
+                    conn,
+                    f'ALTER TABLE "{owner}"."{child_table}" ENABLE NOVALIDATE CONSTRAINT "{constraint_name}"',
+                    tag=tag,
+                    stage=stage,
+                )
+                enabled["referencing_fk_novalidate"].append(display_name)
+            except Exception as exc:
+                _target_index_log(
+                    tag,
+                    f"referencing_fk {display_name} failed err={type(exc).__name__}: {exc}",
+                )
+                if _is_dpy_not_connected(exc):
+                    raise
+                # Referencing FK failure -> defer, never fatal.
+                deferred_fk.append({"name": display_name, "error": str(exc)})
 
         stage = "commit"
         _target_index_log(tag, f"stage={stage}")
